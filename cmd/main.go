@@ -11,6 +11,7 @@ import (
 	"proxy-gateway/internal/config"
 	"proxy-gateway/internal/database"
 	"proxy-gateway/internal/proxy"
+	"proxy-gateway/internal/traffic"
 	"runtime"
 	"strings"
 	"syscall"
@@ -30,7 +31,7 @@ func main() {
 	})
 
 	cfg := config.Load()
-	logger.WithField("port", cfg.Port).Info("Starting Proxy Gateway")
+	logger.WithField("port", cfg.Port).Info("Starting Proxy Gateway (Bridge Mode)")
 
 	switch strings.ToLower(cfg.LogLevel) {
 	case "debug":
@@ -68,11 +69,8 @@ func main() {
 		defer ticker.Stop()
 
 		for range ticker.C {
-			logger.Debug("Refreshing proxy list from database...")
 			if err := proxyProvider.RefreshProxies(); err != nil {
 				logger.WithError(err).Error("Failed to refresh proxies")
-			} else {
-				logger.WithField("proxy_count", proxyProvider.GetProxyCount()).Debug("Refreshed proxies")
 			}
 		}
 	}()
@@ -95,22 +93,27 @@ func main() {
 		defer ticker.Stop()
 
 		for range ticker.C {
-			logger.Debug("Refreshing authorized IPs and users from database...")
 			if err := ipValidator.RefreshAuthorizedIPs(); err != nil {
 				logger.WithError(err).Error("Failed to refresh authorized IPs")
 			}
 			if err := ipValidator.RefreshUsers(); err != nil {
 				logger.WithError(err).Error("Failed to refresh users")
 			}
-			logger.WithFields(logrus.Fields{
-				"authorized_ip_count": ipValidator.GetAuthorizedIPCount(),
-				"user_count":          ipValidator.GetUserCount(),
-			}).Debug("Refreshed authentication data")
 		}
 	}()
 
-	gatewayTimeout := time.Duration(cfg.ProxyTimeout) * time.Second
-	proxyGateway := proxy.NewGateway(proxyProvider, ipValidator, gatewayTimeout, logger)
+	proxyGateway := proxy.NewGateway(proxyProvider, ipValidator, logger)
+
+	// Initialize traffic logger with Redis
+	var trafficLogger *traffic.Logger
+	if cfg.EnableTraffic {
+		trafficLogger, err = traffic.NewLogger(cfg.RedisAddr, cfg.RedisPassword, cfg.RedisDB, logger)
+		if err != nil {
+			logger.WithError(err).Fatal("Failed to initialize traffic logger")
+		}
+		proxyGateway.SetTrafficLogger(trafficLogger)
+		logger.WithField("redis_addr", cfg.RedisAddr).Info("Traffic logging enabled")
+	}
 
 	router := mux.NewRouter()
 
@@ -120,13 +123,16 @@ func main() {
 			http.Error(w, "No proxies available", http.StatusServiceUnavailable)
 			return
 		}
+
+		var queueLen int64
+		if trafficLogger != nil {
+			queueLen, _ = trafficLogger.GetQueueLength(r.Context())
+		}
+
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		response := fmt.Sprintf(`{"status":"healthy","proxy_count":%d,"authorized_ip_count":%d,"user_count":%d}`,
-			proxyCount, ipValidator.GetAuthorizedIPCount(), ipValidator.GetUserCount())
-		if _, err := w.Write([]byte(response)); err != nil {
-			logger.WithError(err).Error("Failed to write health check response")
-		}
+		fmt.Fprintf(w, `{"status":"healthy","proxy_count":%d,"user_count":%d,"queue_length":%d}`,
+			proxyCount, ipValidator.GetUserCount(), queueLen)
 	}).Methods("GET")
 
 	router.PathPrefix("/").HandlerFunc(proxyGateway.HandleHTTP)
@@ -140,17 +146,17 @@ func main() {
 	})
 
 	server := &http.Server{
-		Addr:              ":" + cfg.Port,
-		Handler:           topLevelHandler,
+		Addr:    ":" + cfg.Port,
+		Handler: topLevelHandler,
+		// No timeouts - pure bridge mode
 		ReadTimeout:       0,
 		ReadHeaderTimeout: 0,
 		WriteTimeout:      0,
 		IdleTimeout:       0,
-		MaxHeaderBytes:    0,
 	}
 
 	go func() {
-		logger.WithField("port", cfg.Port).Info("Server starting")
+		logger.WithField("port", cfg.Port).Info("Server starting (no timeouts)")
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.WithError(err).Fatal("Server failed to start")
 		}
@@ -160,7 +166,11 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 
-	logger.Info("Shutting down server...")
+	logger.Info("Shutting down...")
+
+	if trafficLogger != nil {
+		trafficLogger.Close()
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -168,6 +178,6 @@ func main() {
 	if err := server.Shutdown(ctx); err != nil {
 		logger.WithError(err).Error("Server forced to shutdown")
 	} else {
-		logger.Info("Server exited gracefully")
+		logger.Info("Server exited")
 	}
 }

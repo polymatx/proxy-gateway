@@ -6,20 +6,27 @@ import (
 )
 
 type Config struct {
-	Port         string
-	PostgresURI  string
-	ProxyTimeout int
-	LogLevel     string
+	Port          string
+	PostgresURI   string
+	LogLevel      string
+	EnableTraffic bool
+	RedisAddr     string
+	RedisPassword string
+	RedisDB       int
 }
 
 func Load() *Config {
-	timeout, _ := strconv.Atoi(getEnv("PROXY_TIMEOUT", "30"))
+	enableTraffic, _ := strconv.ParseBool(getEnv("ENABLE_TRAFFIC_LOGGING", "true"))
+	redisDB, _ := strconv.Atoi(getEnv("REDIS_DB", "0"))
 
 	return &Config{
-		Port:         getEnv("PORT", "8080"),
-		PostgresURI:  getEnv("POSTGRES_URI", ""),
-		ProxyTimeout: timeout,
-		LogLevel:     getEnv("LOG_LEVEL", "info"),
+		Port:          getEnv("PORT", "8080"),
+		PostgresURI:   getEnv("POSTGRES_URI", ""),
+		LogLevel:      getEnv("LOG_LEVEL", "info"),
+		EnableTraffic: enableTraffic,
+		RedisAddr:     getEnv("REDIS_ADDR", "localhost:6379"),
+		RedisPassword: getEnv("REDIS_PASSWORD", ""),
+		RedisDB:       redisDB,
 	}
 }
 

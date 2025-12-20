@@ -13,7 +13,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"proxy-gateway/internal/traffic"
 
 	"github.com/sirupsen/logrus"
 )
@@ -30,6 +33,7 @@ type Gateway struct {
 	transportCache map[string]*http.Transport
 	transportMu    sync.RWMutex
 	baseTransport  *http.Transport
+	trafficLogger  *traffic.Logger
 }
 
 func NewGateway(provider *ProxyProvider, validator interface {
@@ -37,13 +41,14 @@ func NewGateway(provider *ProxyProvider, validator interface {
 	GetClientIP(r *http.Request) string
 	ValidateRequest(r *http.Request) (bool, string)
 	SendProxyAuthRequired(w http.ResponseWriter)
-}, timeout time.Duration, logger *logrus.Logger) *Gateway {
+}, logger *logrus.Logger) *Gateway {
 	baseTransport := &http.Transport{
 		MaxIdleConns:        1000,
 		MaxIdleConnsPerHost: 100,
 		MaxConnsPerHost:     0,
 		IdleConnTimeout:     90 * time.Second,
 
+		// No timeouts - pure bridge mode
 		TLSHandshakeTimeout:   0,
 		ResponseHeaderTimeout: 0,
 		ExpectContinueTimeout: 0,
@@ -71,6 +76,10 @@ func NewGateway(provider *ProxyProvider, validator interface {
 		baseTransport:  baseTransport,
 		transportCache: make(map[string]*http.Transport),
 	}
+}
+
+func (g *Gateway) SetTrafficLogger(tl *traffic.Logger) {
+	g.trafficLogger = tl
 }
 
 func (g *Gateway) getOrCreateTransport(proxyURLString string) (*http.Transport, error) {
@@ -108,7 +117,7 @@ func (g *Gateway) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 		"method":    r.Method,
 		"url":       r.URL.String(),
 		"host":      r.Host,
-	}).Info("Incoming HTTP request")
+	}).Debug("Incoming HTTP request")
 
 	if valid, reason := g.validator.ValidateRequest(r); !valid {
 		g.logger.WithFields(logrus.Fields{
@@ -124,8 +133,8 @@ func (g *Gateway) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Extract country, session_id, and duration from proxy authentication
-	country, sessionID, duration := g.extractProxyParams(r)
+	// Extract country, session_id, duration and username from proxy authentication
+	username, country, sessionID, duration := g.extractProxyParams(r)
 
 	// Get random proxy from available proxies
 	proxyData := g.provider.GetRandomProxy()
@@ -134,12 +143,6 @@ func (g *Gateway) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "No proxies available", http.StatusServiceUnavailable)
 		return
 	}
-
-	g.logger.WithFields(logrus.Fields{
-		"proxy_name":   proxyData.Name,
-		"proxy_slug":   proxyData.Slug,
-		"url_template": proxyData.URLTemplate,
-	}).Info("Selected random proxy provider")
 
 	// Use provided session_id or generate one if not provided
 	if sessionID == "" {
@@ -156,31 +159,44 @@ func (g *Gateway) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 	proxyURL := proxyData.BuildProxyURL(finalCountry, sessionID, duration)
 
 	g.logger.WithFields(logrus.Fields{
-		"proxy_name":     proxyData.Name,
-		"proxy_base_url": proxyData.BaseURL,
-		"proxy_username": proxyData.Username,
-		"proxy_port_min": proxyData.PortMin,
-		"proxy_port_max": proxyData.PortMax,
-		"url_template":   proxyData.URLTemplate,
-		"proxy_full_url": proxyURL,
-		"target":         r.URL.String(),
-		"target_host":    r.Host,
-		"target_method":  r.Method,
-		"country":        country,
-		"session_id":     sessionID,
-		"duration":       duration,
-		"content_length": r.ContentLength,
-	}).Info("Forwarding HTTP request through proxy")
+		"proxy_slug":  proxyData.Slug,
+		"target_host": r.Host,
+		"country":     country,
+		"session_id":  sessionID,
+	}).Debug("Forwarding HTTP request")
 
-	if err := g.forwardRequest(w, r, proxyURL); err != nil {
+	requestBytes := r.ContentLength
+	if requestBytes < 0 {
+		requestBytes = 0
+	}
+	requestBytes += g.estimateHeaderSize(r.Header)
+
+	responseBytes, statusCode, err := g.forwardRequestWithMetrics(w, r, proxyURL)
+	if err != nil {
 		g.logger.WithFields(logrus.Fields{
 			"error":      err.Error(),
 			"proxy_slug": proxyData.Slug,
 		}).Error("Failed to forward request")
 		http.Error(w, "Proxy Error", http.StatusBadGateway)
+		return
 	}
 
-	g.logger.Info("Request forwarded successfully")
+	// Log traffic
+	if g.trafficLogger != nil && username != "" {
+		g.trafficLogger.Log(traffic.TrafficLogRequest{
+			Username:      username,
+			RequestBytes:  requestBytes,
+			ResponseBytes: responseBytes,
+			TargetHost:    r.Host,
+			TargetMethod:  r.Method,
+			ProxySlug:     proxyData.Slug,
+			Country:       country,
+			SessionID:     sessionID,
+			Duration:      duration,
+			StatusCode:    statusCode,
+			ClientIP:      clientIP,
+		})
+	}
 }
 
 func (g *Gateway) HandleConnect(w http.ResponseWriter, r *http.Request) {
@@ -189,7 +205,7 @@ func (g *Gateway) HandleConnect(w http.ResponseWriter, r *http.Request) {
 		"client_ip": clientIP,
 		"method":    r.Method,
 		"host":      r.Host,
-	}).Info("Incoming CONNECT request")
+	}).Debug("Incoming CONNECT request")
 
 	if valid, reason := g.validator.ValidateRequest(r); !valid {
 		g.logger.WithFields(logrus.Fields{
@@ -205,7 +221,7 @@ func (g *Gateway) HandleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	country, sessionID, duration := g.extractProxyParams(r)
+	username, country, sessionID, duration := g.extractProxyParams(r)
 
 	proxyData := g.provider.GetRandomProxy()
 	if proxyData == nil {
@@ -227,22 +243,38 @@ func (g *Gateway) HandleConnect(w http.ResponseWriter, r *http.Request) {
 	proxyURL := proxyData.BuildProxyURL(finalCountry, sessionID, duration)
 
 	g.logger.WithFields(logrus.Fields{
-		"target":         r.Host,
-		"proxy_slug":     proxyData.Slug,
-		"proxy_full_url": proxyURL,
-		"duration":       duration,
-	}).Info("Handling CONNECT request")
+		"target":     r.Host,
+		"proxy_slug": proxyData.Slug,
+	}).Debug("Handling CONNECT request")
 
-	if err := g.handleConnectTunnel(w, r, proxyURL); err != nil {
+	requestBytes, responseBytes, err := g.handleConnectTunnelWithMetrics(w, r, proxyURL)
+	if err != nil {
 		g.logger.WithError(err).Error("Failed to handle CONNECT")
 		http.Error(w, "Proxy Error", http.StatusBadGateway)
+		return
+	}
+
+	// Log traffic for CONNECT
+	if g.trafficLogger != nil && username != "" {
+		g.trafficLogger.Log(traffic.TrafficLogRequest{
+			Username:      username,
+			RequestBytes:  requestBytes,
+			ResponseBytes: responseBytes,
+			TargetHost:    r.Host,
+			TargetMethod:  "CONNECT",
+			ProxySlug:     proxyData.Slug,
+			Country:       country,
+			SessionID:     sessionID,
+			Duration:      duration,
+			StatusCode:    200,
+			ClientIP:      clientIP,
+		})
 	}
 }
 
-// extractProxyParams extracts country, session_id, and duration from proxy authentication
-// Format: {username}-country-{country}-session-{session_id}-sessTime-{duration}:{password}
-func (g *Gateway) extractProxyParams(r *http.Request) (country, sessionID string, duration int) {
-	// Default values
+// extractProxyParams extracts username, country, session_id, and duration from proxy authentication
+func (g *Gateway) extractProxyParams(r *http.Request) (username, country, sessionID string, duration int) {
+	username = ""
 	country = "US"
 	sessionID = ""
 	duration = 5
@@ -272,34 +304,33 @@ func (g *Gateway) extractProxyParams(r *http.Request) (country, sessionID string
 	}
 
 	usernameStr := credentials[0]
-	country, sessionID, duration = g.parseUsernameFormat(usernameStr)
+	username, country, sessionID, duration = g.parseUsernameFormat(usernameStr)
 	return
 }
 
-// parseUsernameFormat parses the username format:
-// {username}-country-{country}-session-{session_id}-sessTime-{duration}
-func (g *Gateway) parseUsernameFormat(username string) (country, sessionID string, duration int) {
+// parseUsernameFormat parses: {username}-country-{country}-session-{session_id}-sessTime-{duration}
+func (g *Gateway) parseUsernameFormat(usernameStr string) (username, country, sessionID string, duration int) {
 	country = "US"
 	sessionID = ""
 	duration = 5
 
-	// Find -country-
-	countryIdx := strings.Index(username, "-country-")
+	countryIdx := strings.Index(usernameStr, "-country-")
 	if countryIdx == -1 {
+		username = usernameStr
 		return
 	}
-	afterCountry := username[countryIdx+9:] // len("-country-") = 9
 
-	// Find -session-
+	username = usernameStr[:countryIdx]
+	afterCountry := usernameStr[countryIdx+9:]
+
 	sessionIdx := strings.Index(afterCountry, "-session-")
 	if sessionIdx == -1 {
-		// No session, rest might be country or country-sessTime-X
 		sessTimeIdx := strings.Index(afterCountry, "-sessTime-")
 		if sessTimeIdx == -1 {
 			country = afterCountry
 		} else {
 			country = afterCountry[:sessTimeIdx]
-			durationStr := afterCountry[sessTimeIdx+10:] // len("-sessTime-") = 10
+			durationStr := afterCountry[sessTimeIdx+10:]
 			if d, err := strconv.Atoi(durationStr); err == nil && d > 0 {
 				duration = d
 			}
@@ -308,15 +339,14 @@ func (g *Gateway) parseUsernameFormat(username string) (country, sessionID strin
 	}
 
 	country = afterCountry[:sessionIdx]
-	afterSession := afterCountry[sessionIdx+9:] // len("-session-") = 9
+	afterSession := afterCountry[sessionIdx+9:]
 
-	// Find -sessTime-
 	sessTimeIdx := strings.Index(afterSession, "-sessTime-")
 	if sessTimeIdx == -1 {
 		sessionID = afterSession
 	} else {
 		sessionID = afterSession[:sessTimeIdx]
-		durationStr := afterSession[sessTimeIdx+10:] // len("-sessTime-") = 10
+		durationStr := afterSession[sessTimeIdx+10:]
 		if d, err := strconv.Atoi(durationStr); err == nil && d > 0 {
 			duration = d
 		}
@@ -335,15 +365,25 @@ func (g *Gateway) generateSessionID() string {
 	return result.String()
 }
 
-func (g *Gateway) forwardRequest(w http.ResponseWriter, r *http.Request, proxyURLString string) error {
+func (g *Gateway) estimateHeaderSize(headers http.Header) int64 {
+	var size int64
+	for key, values := range headers {
+		for _, value := range values {
+			size += int64(len(key) + len(value) + 4)
+		}
+	}
+	return size
+}
+
+func (g *Gateway) forwardRequestWithMetrics(w http.ResponseWriter, r *http.Request, proxyURLString string) (responseBytes int64, statusCode int, err error) {
 	transport, err := g.getOrCreateTransport(proxyURLString)
 	if err != nil {
-		return err
+		return 0, 0, err
 	}
 
 	client := &http.Client{
 		Transport: transport,
-		Timeout:   0,
+		Timeout:   0, // No timeout - bridge mode
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return nil
 		},
@@ -370,7 +410,7 @@ func (g *Gateway) forwardRequest(w http.ResponseWriter, r *http.Request, proxyUR
 
 	req, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, r.Body)
 	if err != nil {
-		return fmt.Errorf("failed to create request: %v", err)
+		return 0, 0, fmt.Errorf("failed to create request: %v", err)
 	}
 
 	for key, values := range r.Header {
@@ -385,7 +425,7 @@ func (g *Gateway) forwardRequest(w http.ResponseWriter, r *http.Request, proxyUR
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("proxy request failed: %v", err)
+		return 0, 0, fmt.Errorf("proxy request failed: %v", err)
 	}
 	defer resp.Body.Close()
 
@@ -394,20 +434,36 @@ func (g *Gateway) forwardRequest(w http.ResponseWriter, r *http.Request, proxyUR
 	}
 
 	w.WriteHeader(resp.StatusCode)
+	statusCode = resp.StatusCode
 
-	_, err = io.Copy(w, resp.Body)
-	return err
+	cw := &countingWriter{w: w}
+	_, err = io.Copy(cw, resp.Body)
+	responseBytes = cw.bytes + g.estimateHeaderSize(resp.Header)
+
+	return responseBytes, statusCode, err
 }
 
-func (g *Gateway) handleConnectTunnel(w http.ResponseWriter, r *http.Request, proxyURLString string) error {
+type countingWriter struct {
+	w     http.ResponseWriter
+	bytes int64
+}
+
+func (cw *countingWriter) Write(p []byte) (int, error) {
+	n, err := cw.w.Write(p)
+	cw.bytes += int64(n)
+	return n, err
+}
+
+func (g *Gateway) handleConnectTunnelWithMetrics(w http.ResponseWriter, r *http.Request, proxyURLString string) (requestBytes, responseBytes int64, err error) {
 	proxyURL, err := url.Parse(proxyURLString)
 	if err != nil {
-		return fmt.Errorf("invalid proxy URL: %v", err)
+		return 0, 0, fmt.Errorf("invalid proxy URL: %v", err)
 	}
 
-	upstreamConn, err := net.DialTimeout("tcp", proxyURL.Host, 30*time.Second)
+	// No timeout for dial - bridge mode
+	upstreamConn, err := net.Dial("tcp", proxyURL.Host)
 	if err != nil {
-		return fmt.Errorf("failed to connect to upstream proxy: %v", err)
+		return 0, 0, fmt.Errorf("failed to connect to upstream proxy: %v", err)
 	}
 	defer upstreamConn.Close()
 
@@ -427,51 +483,63 @@ func (g *Gateway) handleConnectTunnel(w http.ResponseWriter, r *http.Request, pr
 	}
 
 	if err := connectReq.Write(upstreamConn); err != nil {
-		return fmt.Errorf("failed to write CONNECT: %v", err)
+		return 0, 0, fmt.Errorf("failed to write CONNECT: %v", err)
 	}
 
 	br := bufio.NewReader(upstreamConn)
 	resp, err := http.ReadResponse(br, connectReq)
 	if err != nil {
-		return fmt.Errorf("failed to read CONNECT response: %v", err)
+		return 0, 0, fmt.Errorf("failed to read CONNECT response: %v", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("upstream rejected CONNECT: %d %s", resp.StatusCode, string(body))
+		return 0, 0, fmt.Errorf("upstream rejected CONNECT: %d %s", resp.StatusCode, string(body))
 	}
-
-	upstreamConn.SetDeadline(time.Time{})
 
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
-		return fmt.Errorf("hijacking not supported")
+		return 0, 0, fmt.Errorf("hijacking not supported")
 	}
 
 	clientConn, _, err := hijacker.Hijack()
 	if err != nil {
-		return fmt.Errorf("failed to hijack connection: %v", err)
+		return 0, 0, fmt.Errorf("failed to hijack connection: %v", err)
 	}
 	defer clientConn.Close()
 
 	if _, err := clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
-		return fmt.Errorf("failed to send 200: %v", err)
+		return 0, 0, fmt.Errorf("failed to send 200: %v", err)
 	}
 
+	var reqBytes, respBytes int64
 	errChan := make(chan error, 2)
 
 	go func() {
-		_, err := io.Copy(upstreamConn, clientConn)
+		n, err := io.Copy(upstreamConn, &countingReader{r: clientConn, bytes: &reqBytes})
+		_ = n
 		errChan <- err
 	}()
 
 	go func() {
-		_, err := io.Copy(clientConn, upstreamConn)
+		n, err := io.Copy(clientConn, &countingReader{r: upstreamConn, bytes: &respBytes})
+		_ = n
 		errChan <- err
 	}()
 
 	<-errChan
 
-	return nil
+	return atomic.LoadInt64(&reqBytes), atomic.LoadInt64(&respBytes), nil
+}
+
+type countingReader struct {
+	r     io.Reader
+	bytes *int64
+}
+
+func (cr *countingReader) Read(p []byte) (int, error) {
+	n, err := cr.r.Read(p)
+	atomic.AddInt64(cr.bytes, int64(n))
+	return n, err
 }
