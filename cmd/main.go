@@ -75,7 +75,19 @@ func main() {
 		}
 	}()
 
-	ipValidator := auth.NewIPValidator(dbClient.GetPool(), logger)
+	// Initialize balance checker (uses same Redis as traffic logger)
+	var balanceChecker *auth.BalanceChecker
+	if cfg.EnableTraffic {
+		balanceChecker, err = auth.NewBalanceChecker(cfg.RedisAddr, cfg.RedisPassword, cfg.RedisDB, logger)
+		if err != nil {
+			logger.WithError(err).Warn("Failed to initialize balance checker, balance checking disabled")
+			balanceChecker = nil
+		} else {
+			defer balanceChecker.Close()
+		}
+	}
+
+	ipValidator := auth.NewIPValidator(dbClient.GetPool(), logger, balanceChecker)
 	if err := ipValidator.LoadAuthorizedIPs(); err != nil {
 		logger.WithError(err).Fatal("Failed to load authorized IPs")
 	}
@@ -84,8 +96,9 @@ func main() {
 	}
 
 	logger.WithFields(logrus.Fields{
-		"authorized_ip_count": ipValidator.GetAuthorizedIPCount(),
-		"user_count":          ipValidator.GetUserCount(),
+		"authorized_ip_count":   ipValidator.GetAuthorizedIPCount(),
+		"user_count":            ipValidator.GetUserCount(),
+		"balance_check_enabled": balanceChecker != nil,
 	}).Info("Authentication configured")
 
 	go func() {

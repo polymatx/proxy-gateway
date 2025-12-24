@@ -125,9 +125,12 @@ func (g *Gateway) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 			"reason":    reason,
 		}).Warn("Request validation failed")
 
-		if reason == "Invalid proxy credentials" {
+		switch reason {
+		case "Invalid proxy credentials":
 			g.validator.SendProxyAuthRequired(w)
-		} else {
+		case "Insufficient balance":
+			http.Error(w, "Insufficient balance - please top up your account", http.StatusPaymentRequired)
+		default:
 			http.Error(w, "Access Denied", http.StatusForbidden)
 		}
 		return
@@ -213,9 +216,12 @@ func (g *Gateway) HandleConnect(w http.ResponseWriter, r *http.Request) {
 			"reason":    reason,
 		}).Warn("CONNECT validation failed")
 
-		if reason == "Invalid proxy credentials" {
+		switch reason {
+		case "Invalid proxy credentials":
 			g.validator.SendProxyAuthRequired(w)
-		} else {
+		case "Insufficient balance":
+			http.Error(w, "Insufficient balance - please top up your account", http.StatusPaymentRequired)
+		default:
 			http.Error(w, "Access Denied", http.StatusForbidden)
 		}
 		return

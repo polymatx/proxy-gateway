@@ -36,15 +36,17 @@ type IPValidator struct {
 	users          map[string]string // username -> password
 	mu             sync.RWMutex
 	logger         *logrus.Logger
+	balanceChecker *BalanceChecker
 }
 
-func NewIPValidator(pool *pgxpool.Pool, logger *logrus.Logger) *IPValidator {
+func NewIPValidator(pool *pgxpool.Pool, logger *logrus.Logger, balanceChecker *BalanceChecker) *IPValidator {
 	return &IPValidator{
 		pool:           pool,
 		authorizedIPs:  make(map[string]bool),
 		authorizedNets: make([]*net.IPNet, 0),
 		users:          make(map[string]string),
 		logger:         logger,
+		balanceChecker: balanceChecker,
 	}
 }
 
@@ -167,29 +169,29 @@ func (v *IPValidator) ValidateIP(r *http.Request) bool {
 	return false
 }
 
-func (v *IPValidator) ValidateProxyAuth(r *http.Request) bool {
+func (v *IPValidator) ValidateProxyAuth(r *http.Request) (bool, string) {
 	proxyAuth := r.Header.Get("Proxy-Authorization")
 	if proxyAuth == "" {
 		proxyAuth = r.Header.Get("Authorization")
 		if proxyAuth == "" {
-			return false
+			return false, ""
 		}
 	}
 
 	parts := strings.SplitN(proxyAuth, " ", 2)
 	if len(parts) != 2 || parts[0] != "Basic" {
-		return false
+		return false, ""
 	}
 
 	decoded, err := base64.StdEncoding.DecodeString(parts[1])
 	if err != nil {
-		return false
+		return false, ""
 	}
 
 	// Format: {username}-country-{country}-session-{session_id}-sessTime-{duration}:{password}
 	credentials := strings.SplitN(string(decoded), ":", 2)
 	if len(credentials) < 2 {
-		return false
+		return false, ""
 	}
 
 	usernameStr := credentials[0]
@@ -205,7 +207,10 @@ func (v *IPValidator) ValidateProxyAuth(r *http.Request) bool {
 	expectedPassword, exists := v.users[username]
 	v.mu.RUnlock()
 
-	return exists && expectedPassword == password
+	if exists && expectedPassword == password {
+		return true, username
+	}
+	return false, ""
 }
 
 func (v *IPValidator) ValidateRequest(r *http.Request) (bool, string) {
@@ -213,8 +218,19 @@ func (v *IPValidator) ValidateRequest(r *http.Request) (bool, string) {
 		return false, "IP not authorized"
 	}
 
-	if !v.ValidateProxyAuth(r) {
+	valid, username := v.ValidateProxyAuth(r)
+	if !valid {
 		return false, "Invalid proxy credentials"
+	}
+
+	// Check balance
+	if v.balanceChecker != nil && username != "" {
+		hasBalance, err := v.balanceChecker.HasBalance(r.Context(), username)
+		if err != nil {
+			v.logger.WithError(err).Warn("Failed to check balance, allowing request")
+		} else if !hasBalance {
+			return false, "Insufficient balance"
+		}
 	}
 
 	return true, "OK"
