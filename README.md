@@ -9,6 +9,8 @@ A high-performance HTTP/HTTPS proxy gateway written in Go. Authenticates clients
 
 - **IP Whitelist Authentication** - Supports individual IPs and CIDR ranges
 - **User Authentication** - Dynamic username/password from PostgreSQL
+- **Balance Checking** - Real-time balance verification via Redis cache
+- **Traffic Logging** - Async traffic logging to Redis queue for processing
 - **Random Proxy Selection** - Automatically selects from available proxy providers
 - **Session Management** - Sticky sessions with configurable duration
 - **Country Routing** - Route traffic through specific countries
@@ -25,6 +27,8 @@ A high-performance HTTP/HTTPS proxy gateway written in Go. Authenticates clients
 docker run -d \
   -p 8080:8080 \
   -e POSTGRES_URI="postgres://user:pass@host:5432/dbname" \
+  -e REDIS_ADDR="localhost:6379" \
+  -e ENABLE_TRAFFIC_LOGGING="true" \
   ghcr.io/YOUR_USERNAME/proxy-gateway:latest
 ```
 
@@ -39,9 +43,14 @@ services:
       - "8080:8080"
     environment:
       - POSTGRES_URI=postgres://user:pass@postgres:5432/proxydb
+      - REDIS_ADDR=redis:6379
+      - REDIS_PASSWORD=
+      - REDIS_DB=0
+      - ENABLE_TRAFFIC_LOGGING=true
       - LOG_LEVEL=info
     depends_on:
       - postgres
+      - redis
 
   postgres:
     image: postgres:16-alpine
@@ -52,8 +61,15 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+
 volumes:
   postgres_data:
+  redis_data:
 ```
 
 ### Building from Source
@@ -72,8 +88,11 @@ go build -o proxy-gateway cmd/main.go
 |---------------------|-------------|---------|
 | `PORT` | Server listening port | `8080` |
 | `POSTGRES_URI` | PostgreSQL connection string | **Required** |
-| `PROXY_TIMEOUT` | Request timeout in seconds | `30` |
 | `LOG_LEVEL` | Logging level (debug, info, warn, error) | `info` |
+| `ENABLE_TRAFFIC_LOGGING` | Enable traffic logging and balance checking | `true` |
+| `REDIS_ADDR` | Redis server address | `localhost:6379` |
+| `REDIS_PASSWORD` | Redis password | `` |
+| `REDIS_DB` | Redis database number | `0` |
 
 ## Database Setup
 
@@ -87,6 +106,15 @@ CREATE TABLE users (
     password VARCHAR(255) NOT NULL,
     is_active BOOLEAN DEFAULT true,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- User balances
+CREATE TABLE balances (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id),
+    traffic_bytes BIGINT DEFAULT 0,
+    used_bytes BIGINT DEFAULT 0,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 -- Authorized IPs whitelist
@@ -116,11 +144,32 @@ CREATE TABLE proxies (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Traffic logs
+CREATE TABLE traffic_logs (
+    id BIGSERIAL PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id),
+    request_bytes BIGINT DEFAULT 0,
+    response_bytes BIGINT DEFAULT 0,
+    total_bytes BIGINT DEFAULT 0,
+    target_host VARCHAR(255),
+    target_method VARCHAR(10),
+    proxy_slug VARCHAR(255),
+    country VARCHAR(10),
+    session_id VARCHAR(100),
+    duration INTEGER,
+    status_code INTEGER,
+    client_ip VARCHAR(45),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 -- Indexes
 CREATE INDEX idx_users_username ON users(username);
 CREATE INDEX idx_users_active ON users(is_active);
+CREATE UNIQUE INDEX idx_balances_user_id ON balances(user_id);
 CREATE INDEX idx_authorized_ips_active ON authorized_ips(is_active);
 CREATE INDEX idx_proxies_visible_disabled ON proxies(is_visible, is_disabled);
+CREATE INDEX idx_traffic_logs_user_id ON traffic_logs(user_id);
+CREATE INDEX idx_traffic_logs_created_at ON traffic_logs(created_at);
 ```
 
 ### Example Data
@@ -128,6 +177,9 @@ CREATE INDEX idx_proxies_visible_disabled ON proxies(is_visible, is_disabled);
 ```sql
 -- Add a user
 INSERT INTO users (username, password) VALUES ('myuser', 'mysecretpass');
+
+-- Add balance (10GB)
+INSERT INTO balances (user_id, traffic_bytes, used_bytes) VALUES (1, 10737418240, 0);
 
 -- Add authorized IP
 INSERT INTO authorized_ips (ip, description) VALUES ('203.0.113.50', 'Office IP');
@@ -195,8 +247,58 @@ Response:
 {
   "status": "healthy",
   "proxy_count": 5,
-  "authorized_ip_count": 10,
-  "user_count": 3
+  "user_count": 3,
+  "queue_length": 42
+}
+```
+
+## Balance Checking
+
+The gateway checks user balance before allowing requests:
+
+1. **Redis Cache** - Balance is cached in Redis with key `balance:cache:{username}`
+2. **Fail-Open** - If cache miss, request is allowed (balance synced by worker)
+3. **HTTP 402** - If balance ≤ 0, returns "Payment Required"
+
+### How It Works
+
+```
+Request → IP Check → Auth Check → Balance Check → Forward to Proxy
+                                       │
+                                       ├── Cache Hit & Balance > 0 → Allow
+                                       ├── Cache Hit & Balance ≤ 0 → HTTP 402
+                                       └── Cache Miss → Allow (fail-open)
+```
+
+The balance cache is updated by a separate worker service that:
+1. Consumes traffic logs from Redis queue
+2. Updates `used_bytes` in PostgreSQL
+3. Updates `balance:cache:{username}` in Redis
+
+## Traffic Logging
+
+When `ENABLE_TRAFFIC_LOGGING=true`, the gateway logs all traffic to a Redis queue:
+
+- **Queue Name**: `traffic:logs`
+- **Format**: JSON with request/response bytes, target host, proxy used, etc.
+- **Processing**: Consumed by a worker service for persistence
+
+### Traffic Log Structure
+
+```json
+{
+  "username": "myuser",
+  "request_bytes": 1024,
+  "response_bytes": 4096,
+  "target_host": "api.example.com:443",
+  "target_method": "CONNECT",
+  "proxy_slug": "example-provider",
+  "country": "US",
+  "session_id": "abc123",
+  "duration": 5,
+  "status_code": 200,
+  "client_ip": "203.0.113.50",
+  "timestamp": 1703001234567
 }
 ```
 
@@ -232,14 +334,33 @@ Set `country_format` in the proxies table:
 │   Client    │────▶│  Proxy Gateway  │────▶│ Upstream Proxies │
 └─────────────┘     └─────────────────┘     └──────────────────┘
                             │
-                            ▼
-                    ┌───────────────┐
-                    │  PostgreSQL   │
-                    │  - users      │
-                    │  - auth_ips   │
-                    │  - proxies    │
-                    └───────────────┘
+                    ┌───────┴───────┐
+                    ▼               ▼
+            ┌───────────────┐ ┌─────────────┐
+            │  PostgreSQL   │ │    Redis    │
+            │  - users      │ │  - traffic  │
+            │  - balances   │ │    queue    │
+            │  - auth_ips   │ │  - balance  │
+            │  - proxies    │ │    cache    │
+            └───────────────┘ └─────────────┘
+                                    │
+                                    ▼
+                            ┌───────────────┐
+                            │ Worker Service│
+                            │ (luminaproxy- │
+                            │     api)      │
+                            └───────────────┘
 ```
+
+## Error Responses
+
+| HTTP Code | Reason |
+|-----------|--------|
+| 402 | Insufficient balance |
+| 403 | IP not authorized |
+| 407 | Invalid proxy credentials |
+| 502 | Upstream proxy error |
+| 503 | No proxies available |
 
 ## Contributing
 
