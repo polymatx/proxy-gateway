@@ -189,6 +189,7 @@ func (v *IPValidator) ValidateProxyAuth(r *http.Request) (bool, string) {
 	}
 
 	// Format: {username}-country-{country}-session-{session_id}-sessTime-{duration}:{password}
+	// OR: {username}-session-{session_id}-sessTime-{duration}:{password} (global proxy)
 	credentials := strings.SplitN(string(decoded), ":", 2)
 	if len(credentials) < 2 {
 		return false, ""
@@ -197,9 +198,13 @@ func (v *IPValidator) ValidateProxyAuth(r *http.Request) (bool, string) {
 	usernameStr := credentials[0]
 	password := credentials[1]
 
-	// Extract base username (everything before -country-)
+	// Extract base username (everything before -country- or -session- or -sessTime-)
 	username := usernameStr
 	if idx := strings.Index(usernameStr, "-country-"); idx != -1 {
+		username = usernameStr[:idx]
+	} else if idx := strings.Index(usernameStr, "-session-"); idx != -1 {
+		username = usernameStr[:idx]
+	} else if idx := strings.Index(usernameStr, "-sessTime-"); idx != -1 {
 		username = usernameStr[:idx]
 	}
 
