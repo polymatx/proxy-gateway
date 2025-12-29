@@ -136,30 +136,43 @@ func (g *Gateway) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Extract country, session_id, duration and username from proxy authentication
-	username, country, sessionID, duration := g.extractProxyParams(r)
+	// Extract country, session_id, duration, username, and whether to use global proxy
+	username, country, sessionID, duration, useGlobal := g.extractProxyParams(r)
 
-	// Get random proxy from available proxies
-	proxyData := g.provider.GetRandomProxy()
+	// Generate session ID if not provided (for non-sticky requests)
+	generatedSession := false
+	if sessionID == "" {
+		sessionID = g.generateSessionID()
+		generatedSession = true
+	}
+
+	// Get proxy for session (sticky if session provided, random if generated)
+	// useGlobal=true when no -country- is specified, useGlobal=false when country is specified
+	var proxyData *ProxyData
+	if generatedSession {
+		// No stickiness needed for generated sessions
+		if useGlobal {
+			proxyData = g.provider.GetRandomGlobalProxy()
+		} else {
+			proxyData = g.provider.GetRandomNonGlobalProxy()
+		}
+	} else {
+		// Use session-aware selection for sticky sessions
+		proxyData = g.provider.GetProxyForSession(r.Context(), username, country, sessionID, duration, useGlobal)
+	}
 	if proxyData == nil {
-		g.logger.Error("No proxies available")
+		proxyType := "non-global"
+		if useGlobal {
+			proxyType = "global"
+		}
+		g.logger.WithField("proxy_type", proxyType).Error("No proxies available")
 		http.Error(w, "No proxies available", http.StatusServiceUnavailable)
 		return
 	}
 
-	// Use provided session_id or generate one if not provided
-	if sessionID == "" {
-		sessionID = g.generateSessionID()
-	}
-
 	// Build the actual proxy URL using the template
-	var finalCountry string
-	if proxyData.IsGlobal {
-		finalCountry = ""
-	} else {
-		finalCountry = country
-	}
-	proxyURL := proxyData.BuildProxyURL(finalCountry, sessionID, duration)
+	// For global proxies, don't pass country; for non-global, use the specified country
+	proxyURL := proxyData.BuildProxyURL(country, sessionID, duration)
 
 	g.logger.WithFields(logrus.Fields{
 		"proxy_slug":  proxyData.Slug,
@@ -227,26 +240,41 @@ func (g *Gateway) HandleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	username, country, sessionID, duration := g.extractProxyParams(r)
+	username, country, sessionID, duration, useGlobal := g.extractProxyParams(r)
 
-	proxyData := g.provider.GetRandomProxy()
+	// Generate session ID if not provided (for non-sticky requests)
+	generatedSession := false
+	if sessionID == "" {
+		sessionID = g.generateSessionID()
+		generatedSession = true
+	}
+
+	// Get proxy for session (sticky if session provided, random if generated)
+	// useGlobal=true when no -country- is specified, useGlobal=false when country is specified
+	var proxyData *ProxyData
+	if generatedSession {
+		// No stickiness needed for generated sessions
+		if useGlobal {
+			proxyData = g.provider.GetRandomGlobalProxy()
+		} else {
+			proxyData = g.provider.GetRandomNonGlobalProxy()
+		}
+	} else {
+		// Use session-aware selection for sticky sessions
+		proxyData = g.provider.GetProxyForSession(r.Context(), username, country, sessionID, duration, useGlobal)
+	}
 	if proxyData == nil {
-		g.logger.Error("No proxies available for CONNECT")
+		proxyType := "non-global"
+		if useGlobal {
+			proxyType = "global"
+		}
+		g.logger.WithField("proxy_type", proxyType).Error("No proxies available for CONNECT")
 		http.Error(w, "No proxies available", http.StatusServiceUnavailable)
 		return
 	}
 
-	if sessionID == "" {
-		sessionID = g.generateSessionID()
-	}
-
-	var finalCountry string
-	if proxyData.IsGlobal {
-		finalCountry = ""
-	} else {
-		finalCountry = country
-	}
-	proxyURL := proxyData.BuildProxyURL(finalCountry, sessionID, duration)
+	// Build the actual proxy URL using the template
+	proxyURL := proxyData.BuildProxyURL(country, sessionID, duration)
 
 	g.logger.WithFields(logrus.Fields{
 		"target":     r.Host,
@@ -278,12 +306,14 @@ func (g *Gateway) HandleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// extractProxyParams extracts username, country, session_id, and duration from proxy authentication
-func (g *Gateway) extractProxyParams(r *http.Request) (username, country, sessionID string, duration int) {
+// extractProxyParams extracts username, country, session_id, duration and whether to use global proxy
+// useGlobal is true when no -country- parameter is provided
+func (g *Gateway) extractProxyParams(r *http.Request) (username, country, sessionID string, duration int, useGlobal bool) {
 	username = ""
-	country = "US"
+	country = ""
 	sessionID = ""
 	duration = 5
+	useGlobal = true // Default to global when no country specified
 
 	proxyAuth := r.Header.Get("Proxy-Authorization")
 	if proxyAuth == "" {
@@ -310,22 +340,52 @@ func (g *Gateway) extractProxyParams(r *http.Request) (username, country, sessio
 	}
 
 	usernameStr := credentials[0]
-	username, country, sessionID, duration = g.parseUsernameFormat(usernameStr)
+	username, country, sessionID, duration, useGlobal = g.parseUsernameFormat(usernameStr)
 	return
 }
 
 // parseUsernameFormat parses: {username}-country-{country}-session-{session_id}-sessTime-{duration}
-func (g *Gateway) parseUsernameFormat(usernameStr string) (username, country, sessionID string, duration int) {
-	country = "US"
+// Returns useGlobal=true when no -country- is present, useGlobal=false when country is specified
+func (g *Gateway) parseUsernameFormat(usernameStr string) (username, country, sessionID string, duration int, useGlobal bool) {
+	country = ""
 	sessionID = ""
 	duration = 5
+	useGlobal = true // Default: no country = use global proxy
 
 	countryIdx := strings.Index(usernameStr, "-country-")
 	if countryIdx == -1 {
+		// No -country- parameter: parse for -session- directly
 		username = usernameStr
-		return
+		sessionIdx := strings.Index(usernameStr, "-session-")
+		if sessionIdx != -1 {
+			username = usernameStr[:sessionIdx]
+			afterSession := usernameStr[sessionIdx+9:]
+			sessTimeIdx := strings.Index(afterSession, "-sessTime-")
+			if sessTimeIdx == -1 {
+				sessionID = afterSession
+			} else {
+				sessionID = afterSession[:sessTimeIdx]
+				durationStr := afterSession[sessTimeIdx+10:]
+				if d, err := strconv.Atoi(durationStr); err == nil && d > 0 {
+					duration = d
+				}
+			}
+		} else {
+			// Check for -sessTime- without session
+			sessTimeIdx := strings.Index(usernameStr, "-sessTime-")
+			if sessTimeIdx != -1 {
+				username = usernameStr[:sessTimeIdx]
+				durationStr := usernameStr[sessTimeIdx+10:]
+				if d, err := strconv.Atoi(durationStr); err == nil && d > 0 {
+					duration = d
+				}
+			}
+		}
+		return // useGlobal remains true
 	}
 
+	// Country is specified: use non-global proxy
+	useGlobal = false
 	username = usernameStr[:countryIdx]
 	afterCountry := usernameStr[countryIdx+9:]
 

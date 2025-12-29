@@ -94,10 +94,11 @@ func (p *ProxyData) getPort() int {
 }
 
 type ProxyProvider struct {
-	pool     *pgxpool.Pool
-	proxies  []ProxyData
-	proxyMap map[string]*ProxyData
-	mu       sync.RWMutex
+	pool         *pgxpool.Pool
+	proxies      []ProxyData
+	proxyMap     map[string]*ProxyData
+	mu           sync.RWMutex
+	sessionCache *SessionCache
 }
 
 func NewProxyProvider(pool *pgxpool.Pool) *ProxyProvider {
@@ -105,6 +106,11 @@ func NewProxyProvider(pool *pgxpool.Pool) *ProxyProvider {
 		pool:     pool,
 		proxyMap: make(map[string]*ProxyData),
 	}
+}
+
+// SetSessionCache sets the Redis session cache for sticky sessions
+func (p *ProxyProvider) SetSessionCache(cache *SessionCache) {
+	p.sessionCache = cache
 }
 
 func (p *ProxyProvider) LoadProxies() error {
@@ -182,6 +188,44 @@ func (p *ProxyProvider) GetRandomProxy() *ProxyData {
 	return &p.proxies[idx]
 }
 
+// GetRandomGlobalProxy returns a random proxy where is_global = true
+func (p *ProxyProvider) GetRandomGlobalProxy() *ProxyData {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	var globalProxies []*ProxyData
+	for i := range p.proxies {
+		if p.proxies[i].IsGlobal {
+			globalProxies = append(globalProxies, &p.proxies[i])
+		}
+	}
+
+	if len(globalProxies) == 0 {
+		return nil
+	}
+
+	return globalProxies[rand.Intn(len(globalProxies))]
+}
+
+// GetRandomNonGlobalProxy returns a random proxy where is_global = false
+func (p *ProxyProvider) GetRandomNonGlobalProxy() *ProxyData {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	var nonGlobalProxies []*ProxyData
+	for i := range p.proxies {
+		if !p.proxies[i].IsGlobal {
+			nonGlobalProxies = append(nonGlobalProxies, &p.proxies[i])
+		}
+	}
+
+	if len(nonGlobalProxies) == 0 {
+		return nil
+	}
+
+	return nonGlobalProxies[rand.Intn(len(nonGlobalProxies))]
+}
+
 func (p *ProxyProvider) GetProxyCount() int {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -192,4 +236,48 @@ func (p *ProxyProvider) GetAllProxies() []ProxyData {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return append([]ProxyData(nil), p.proxies...)
+}
+
+// GetProxyForSession returns a proxy for the given session, ensuring stickiness
+// If a session ID is provided and we have a cached proxy, return that proxy
+// Otherwise, select a random proxy and cache it for future requests
+// useGlobal determines whether to select from global (is_global=true) or non-global proxies
+func (p *ProxyProvider) GetProxyForSession(ctx context.Context, username, country, sessionID string, durationMinutes int, useGlobal bool) *ProxyData {
+	// If no session ID, just return random proxy based on global flag (no stickiness)
+	if sessionID == "" {
+		if useGlobal {
+			return p.GetRandomGlobalProxy()
+		}
+		return p.GetRandomNonGlobalProxy()
+	}
+
+	// Try to get cached proxy for this session
+	if p.sessionCache != nil {
+		cachedSlug, err := p.sessionCache.GetProxySlug(ctx, username, country, sessionID, useGlobal)
+		if err == nil && cachedSlug != "" {
+			// Cache hit - return the same proxy
+			if proxy := p.GetProxyBySlug(cachedSlug); proxy != nil {
+				return proxy
+			}
+			// Cached proxy no longer exists, fall through to select new one
+		}
+	}
+
+	// No cache or cache miss - select random proxy based on global flag
+	var proxy *ProxyData
+	if useGlobal {
+		proxy = p.GetRandomGlobalProxy()
+	} else {
+		proxy = p.GetRandomNonGlobalProxy()
+	}
+	if proxy == nil {
+		return nil
+	}
+
+	// Cache the selection for future requests with same session
+	if p.sessionCache != nil && proxy.Slug != "" {
+		_ = p.sessionCache.SetProxySlug(ctx, username, country, sessionID, proxy.Slug, durationMinutes, useGlobal)
+	}
+
+	return proxy
 }

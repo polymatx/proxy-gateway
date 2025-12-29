@@ -64,6 +64,16 @@ func main() {
 	}
 	logger.WithField("proxy_count", proxyProvider.GetProxyCount()).Info("Loaded proxies from database")
 
+	// Initialize session cache for sticky sessions (uses Redis)
+	sessionCache, err := proxy.NewSessionCache(cfg.RedisAddr, cfg.RedisPassword, cfg.RedisDB, logger)
+	if err != nil {
+		logger.WithError(err).Warn("Failed to initialize session cache, sticky sessions disabled")
+	} else {
+		proxyProvider.SetSessionCache(sessionCache)
+		defer sessionCache.Close()
+		logger.Info("Session cache enabled for sticky sessions")
+	}
+
 	go func() {
 		ticker := time.NewTicker(5 * time.Minute)
 		defer ticker.Stop()
