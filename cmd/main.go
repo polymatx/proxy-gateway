@@ -163,7 +163,12 @@ func main() {
 	topLevelHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodConnect {
 			proxyGateway.HandleConnect(w, r)
+		} else if r.URL.IsAbs() {
+			// Proxy-mode HTTP request (e.g., GET http://example.com/)
+			// Bypass mux to prevent URL modification
+			proxyGateway.HandleHTTP(w, r)
 		} else {
+			// Direct request (e.g., GET /health)
 			router.ServeHTTP(w, r)
 		}
 	})

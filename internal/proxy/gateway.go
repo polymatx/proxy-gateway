@@ -12,7 +12,6 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -29,11 +28,9 @@ type Gateway struct {
 		ValidateRequest(r *http.Request) (bool, string)
 		SendProxyAuthRequired(w http.ResponseWriter)
 	}
-	logger         *logrus.Logger
-	transportCache map[string]*http.Transport
-	transportMu    sync.RWMutex
-	baseTransport  *http.Transport
-	trafficLogger  *traffic.Logger
+	logger        *logrus.Logger
+	baseTransport *http.Transport
+	trafficLogger *traffic.Logger
 }
 
 func NewGateway(provider *ProxyProvider, validator interface {
@@ -70,11 +67,10 @@ func NewGateway(provider *ProxyProvider, validator interface {
 	}
 
 	return &Gateway{
-		provider:       provider,
-		validator:      validator,
-		logger:         logger,
-		baseTransport:  baseTransport,
-		transportCache: make(map[string]*http.Transport),
+		provider:      provider,
+		validator:     validator,
+		logger:        logger,
+		baseTransport: baseTransport,
 	}
 }
 
@@ -82,31 +78,14 @@ func (g *Gateway) SetTrafficLogger(tl *traffic.Logger) {
 	g.trafficLogger = tl
 }
 
-func (g *Gateway) getOrCreateTransport(proxyURLString string) (*http.Transport, error) {
-	g.transportMu.RLock()
-	if transport, exists := g.transportCache[proxyURLString]; exists {
-		g.transportMu.RUnlock()
-		return transport, nil
-	}
-	g.transportMu.RUnlock()
-
+func (g *Gateway) createTransport(proxyURLString string) (*http.Transport, error) {
 	proxyURL, err := url.Parse(proxyURLString)
 	if err != nil {
 		return nil, fmt.Errorf("invalid proxy URL: %v", err)
 	}
 
-	g.transportMu.Lock()
-	defer g.transportMu.Unlock()
-
-	if transport, exists := g.transportCache[proxyURLString]; exists {
-		return transport, nil
-	}
-
 	transport := g.baseTransport.Clone()
 	transport.Proxy = http.ProxyURL(proxyURL)
-
-	g.transportCache[proxyURLString] = transport
-
 	return transport, nil
 }
 
@@ -190,8 +169,10 @@ func (g *Gateway) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 	responseBytes, statusCode, err := g.forwardRequestWithMetrics(w, r, proxyURL)
 	if err != nil {
 		g.logger.WithFields(logrus.Fields{
-			"error":      err.Error(),
-			"proxy_slug": proxyData.Slug,
+			"error":       err.Error(),
+			"proxy_slug":  proxyData.Slug,
+			"target_url":  r.URL.String(),
+			"target_host": r.Host,
 		}).Error("Failed to forward request")
 		http.Error(w, "Proxy Error", http.StatusBadGateway)
 		return
@@ -442,15 +423,19 @@ func (g *Gateway) estimateHeaderSize(headers http.Header) int64 {
 }
 
 func (g *Gateway) forwardRequestWithMetrics(w http.ResponseWriter, r *http.Request, proxyURLString string) (responseBytes int64, statusCode int, err error) {
-	transport, err := g.getOrCreateTransport(proxyURLString)
+	transport, err := g.createTransport(proxyURLString)
 	if err != nil {
 		return 0, 0, err
 	}
+	defer transport.CloseIdleConnections()
 
 	client := &http.Client{
 		Transport: transport,
 		Timeout:   0, // No timeout - bridge mode
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 3 {
+				return fmt.Errorf("too many redirects")
+			}
 			return nil
 		},
 	}
