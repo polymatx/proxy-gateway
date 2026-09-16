@@ -88,7 +88,7 @@ func main() {
 	// Initialize balance checker (uses same Redis as traffic logger)
 	var balanceChecker *auth.BalanceChecker
 	if cfg.EnableTraffic {
-		balanceChecker, err = auth.NewBalanceChecker(cfg.RedisAddr, cfg.RedisPassword, cfg.RedisDB, logger)
+		balanceChecker, err = auth.NewBalanceChecker(cfg.RedisAddr, cfg.RedisPassword, cfg.RedisDB, dbClient.GetPool(), logger)
 		if err != nil {
 			logger.WithError(err).Warn("Failed to initialize balance checker, balance checking disabled")
 			balanceChecker = nil
