@@ -109,6 +109,7 @@ func main() {
 		"authorized_ip_count":   ipValidator.GetAuthorizedIPCount(),
 		"user_count":            ipValidator.GetUserCount(),
 		"balance_check_enabled": balanceChecker != nil,
+		"meter_interval":        cfg.MeterInterval.String(),
 	}).Info("Authentication configured")
 
 	go func() {
@@ -126,6 +127,13 @@ func main() {
 	}()
 
 	proxyGateway := proxy.NewGateway(proxyProvider, ipValidator, logger)
+	proxyGateway.SetMeterInterval(cfg.MeterInterval)
+	if balanceChecker != nil {
+		// Guarded rather than passed unconditionally: a nil *BalanceChecker
+		// stored in the interface would be non-nil to the gateway and panic on
+		// first use.
+		proxyGateway.SetBalanceChecker(balanceChecker)
+	}
 
 	// Initialize traffic logger with Redis
 	var trafficLogger *traffic.Logger

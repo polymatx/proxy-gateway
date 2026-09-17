@@ -2,11 +2,13 @@ package proxy
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/rand"
 	"net"
 	"net/http"
@@ -32,6 +34,15 @@ type Gateway struct {
 	logger        *logrus.Logger
 	baseTransport *http.Transport
 	trafficLogger *traffic.Logger
+	balance       BalanceReader
+	meterInterval time.Duration
+}
+
+// BalanceReader reports how many bytes a user still has to spend. The auth
+// package's BalanceChecker satisfies it; it is declared here so the proxy
+// package does not depend on auth.
+type BalanceReader interface {
+	Remaining(ctx context.Context, username string) (int64, error)
 }
 
 func NewGateway(provider *ProxyProvider, validator interface {
@@ -77,6 +88,28 @@ func NewGateway(provider *ProxyProvider, validator interface {
 
 func (g *Gateway) SetTrafficLogger(tl *traffic.Logger) {
 	g.trafficLogger = tl
+}
+
+// SetBalanceChecker enables mid-tunnel metering. Without it a CONNECT tunnel is
+// only checked against the balance when it opens, and nothing stops a user with
+// an empty account from transferring indefinitely inside a single tunnel.
+func (g *Gateway) SetBalanceChecker(b BalanceReader) {
+	g.balance = b
+}
+
+// SetMeterInterval sets how often an open tunnel reports the bytes it has moved
+// and is re-checked against the balance. Zero keeps the default.
+func (g *Gateway) SetMeterInterval(d time.Duration) {
+	if d > 0 {
+		g.meterInterval = d
+	}
+}
+
+func (g *Gateway) tunnelMeterInterval() time.Duration {
+	if g.meterInterval > 0 {
+		return g.meterInterval
+	}
+	return defaultMeterInterval
 }
 
 func (g *Gateway) createTransport(proxyURLString string) (*http.Transport, error) {
@@ -274,28 +307,88 @@ func (g *Gateway) HandleConnect(w http.ResponseWriter, r *http.Request) {
 		"proxy_slug": proxyData.Slug,
 	}).Debug("Handling CONNECT request")
 
-	requestBytes, responseBytes, used, err := g.handleConnectTunnelWithMetrics(w, r, choice, rotate)
+	// One slice of a tunnel's traffic. A short tunnel produces a single row on
+	// close, exactly as before; a long one produces a row per metering
+	// interval, so the worker can deduct it while the tunnel is still open.
+	logSlice := func(sessionID string, reqBytes, respBytes int64) {
+		if g.trafficLogger == nil || username == "" || (reqBytes <= 0 && respBytes <= 0) {
+			return
+		}
+		g.trafficLogger.Log(traffic.TrafficLogRequest{
+			Username:      username,
+			RequestBytes:  reqBytes,
+			ResponseBytes: respBytes,
+			TargetHost:    r.Host,
+			TargetMethod:  "CONNECT",
+			ProxySlug:     proxyData.Slug,
+			Country:       country,
+			SessionID:     sessionID,
+			Duration:      duration,
+			StatusCode:    200,
+			ClientIP:      clientIP,
+		})
+	}
+
+	requestBytes, responseBytes, used, err := g.handleConnectTunnelWithMetrics(w, r, choice, rotate, g.newTunnelMeter(username, logSlice))
 	if err != nil {
 		g.logger.WithError(err).Error("Failed to handle CONNECT")
 		http.Error(w, "Proxy Error", http.StatusBadGateway)
 		return
 	}
 
-	// Log traffic for CONNECT
-	if g.trafficLogger != nil && username != "" {
-		g.trafficLogger.Log(traffic.TrafficLogRequest{
-			Username:      username,
-			RequestBytes:  requestBytes,
-			ResponseBytes: responseBytes,
-			TargetHost:    r.Host,
-			TargetMethod:  "CONNECT",
-			ProxySlug:     proxyData.Slug,
-			Country:       country,
-			SessionID:     used.SessionID,
-			Duration:      duration,
-			StatusCode:    200,
-			ClientIP:      clientIP,
-		})
+	// Whatever the meter did not already report.
+	logSlice(used.SessionID, requestBytes, responseBytes)
+}
+
+// newTunnelMeter builds the meter for one CONNECT tunnel: it reports traffic as
+// it happens and closes the tunnel once the account is spent.
+//
+// The budget is the balance read when the tunnel opens, spent down locally so
+// enforcement is immediate rather than waiting for the worker to catch up. The
+// balance is also re-read on each report, which is what stops several
+// concurrent tunnels from each spending the same allowance.
+func (g *Gateway) newTunnelMeter(username string, logSlice func(sessionID string, reqBytes, respBytes int64)) *tunnelMeter {
+	if g.trafficLogger == nil || username == "" {
+		return nil
+	}
+
+	budget := int64(math.MaxInt64)
+	if g.balance != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), balanceReadTimeout)
+		remaining, err := g.balance.Remaining(ctx, username)
+		cancel()
+		if err != nil {
+			g.logger.WithError(err).WithField("username", username).
+				Warn("Could not read balance for tunnel budget, tunnel will not be capped")
+		} else {
+			budget = remaining
+		}
+	}
+
+	return &tunnelMeter{
+		interval: g.tunnelMeterInterval(),
+		budget:   budget,
+		flush: func(sessionID string, reqDelta, respDelta int64) bool {
+			logSlice(sessionID, reqDelta, respDelta)
+
+			if g.balance == nil {
+				return true
+			}
+
+			// The budget itself is enforced per read; this second check is what
+			// keeps several concurrent tunnels from each spending the same
+			// allowance, once the worker has deducted the slices above.
+			// Normally a Redis hit on the entry the worker just wrote.
+			ctx, cancel := context.WithTimeout(context.Background(), balanceReadTimeout)
+			remaining, err := g.balance.Remaining(ctx, username)
+			cancel()
+			if err != nil {
+				// Unreadable balance keeps the tunnel open; the local budget
+				// still bounds it.
+				return true
+			}
+			return remaining > 0
+		},
 	}
 }
 
@@ -535,7 +628,41 @@ const (
 	// retries recover almost all of them; more only delays the 502.
 	connectAttempts  = 3
 	connectRetryBase = 100 * time.Millisecond
+
+	// How often an open tunnel reports what it has moved and is re-checked
+	// against the balance. This bounds how far a user can overshoot an empty
+	// account: one interval's worth of transfer, not the whole session.
+	defaultMeterInterval = 15 * time.Second
+
+	// A balance read is a Redis GET, or a single indexed row when the cache
+	// has expired; it must never hold a tunnel up.
+	balanceReadTimeout = 3 * time.Second
 )
+
+// tunnelMeter is consulted while a CONNECT tunnel is open. flush receives the
+// bytes moved since the previous call and reports whether the tunnel may stay
+// open; returning false tears it down.
+type tunnelMeter struct {
+	interval time.Duration
+	// budget is the hard ceiling, in bytes, for this tunnel. It is enforced on
+	// every read rather than on the interval, because a tick-based check lets a
+	// fast tunnel overshoot by interval x throughput -- tens of megabytes of
+	// unpaid traffic. Enforced inline, the overshoot is one read buffer.
+	budget int64
+	flush  func(sessionID string, reqDelta, respDelta int64) (keepOpen bool)
+}
+
+// errBudgetExhausted ends the copy that spends the last of the budget.
+var errBudgetExhausted = errors.New("tunnel budget exhausted")
+
+// tunnelBudget is the shared allowance both directions of one tunnel draw on.
+type tunnelBudget struct {
+	remaining int64 // atomic
+}
+
+func (b *tunnelBudget) spend(n int64) bool {
+	return atomic.AddInt64(&b.remaining, -n) > 0
+}
 
 // dialUpstreamTunnel opens the upstream proxy connection and completes the
 // CONNECT handshake for target. On success the returned reader must be used
@@ -601,7 +728,11 @@ type upstreamChoice struct {
 // upstream session: a request that was refused three times on one exit node
 // is usually that node's problem, not a momentary blip, so knocking on the
 // same door again rarely helps. Sticky sessions pass nil and keep their exit.
-func (g *Gateway) handleConnectTunnelWithMetrics(w http.ResponseWriter, r *http.Request, choice upstreamChoice, rotate func() upstreamChoice) (requestBytes, responseBytes int64, used upstreamChoice, err error) {
+// meter, when non-nil, is ticked while the tunnel is open: it reports traffic
+// as it happens and can close the tunnel when the account runs dry. The byte
+// counts returned are only the tail the meter has not already reported, so the
+// caller must not log the whole session again.
+func (g *Gateway) handleConnectTunnelWithMetrics(w http.ResponseWriter, r *http.Request, choice upstreamChoice, rotate func() upstreamChoice, meter *tunnelMeter) (requestBytes, responseBytes int64, used upstreamChoice, err error) {
 	var (
 		upstreamConn net.Conn
 		br           *bufio.Reader
@@ -648,28 +779,85 @@ func (g *Gateway) handleConnectTunnelWithMetrics(w http.ResponseWriter, r *http.
 	var reqBytes, respBytes int64
 	errChan := make(chan error, 2)
 
+	var budget *tunnelBudget
+	if meter != nil && meter.budget > 0 {
+		budget = &tunnelBudget{remaining: meter.budget}
+	}
+
 	go func() {
-		_, err := io.Copy(upstreamConn, &countingReader{r: clientConn, bytes: &reqBytes})
+		_, err := io.Copy(upstreamConn, &countingReader{r: clientConn, bytes: &reqBytes, budget: budget})
 		errChan <- err
 	}()
 
 	go func() {
-		_, err := io.Copy(clientConn, &countingReader{r: br, bytes: &respBytes})
+		_, err := io.Copy(clientConn, &countingReader{r: br, bytes: &respBytes, budget: budget})
 		errChan <- err
 	}()
 
-	<-errChan
+	if meter == nil {
+		<-errChan
+		return atomic.LoadInt64(&reqBytes), atomic.LoadInt64(&respBytes), choice, nil
+	}
 
-	return atomic.LoadInt64(&reqBytes), atomic.LoadInt64(&respBytes), choice, nil
+	// Everything reported to the meter is subtracted from the tail we hand
+	// back, so a long session is billed once, in slices, rather than twice.
+	var reportedReq, reportedResp int64
+	ticker := time.NewTicker(meter.interval)
+	defer ticker.Stop()
+
+metering:
+	for {
+		select {
+		case copyErr := <-errChan:
+			if errors.Is(copyErr, errBudgetExhausted) {
+				g.logger.WithFields(logrus.Fields{
+					"target":     r.Host,
+					"session_id": choice.SessionID,
+				}).Info("Closing tunnel: traffic allowance spent")
+			}
+			break metering
+		case <-ticker.C:
+			nowReq := atomic.LoadInt64(&reqBytes)
+			nowResp := atomic.LoadInt64(&respBytes)
+			deltaReq, deltaResp := nowReq-reportedReq, nowResp-reportedResp
+			if deltaReq <= 0 && deltaResp <= 0 {
+				// Idle interval: nothing to bill and nothing new to decide on.
+				continue
+			}
+			reportedReq, reportedResp = nowReq, nowResp
+			if meter.flush(choice.SessionID, deltaReq, deltaResp) {
+				continue
+			}
+			g.logger.WithFields(logrus.Fields{
+				"target":     r.Host,
+				"session_id": choice.SessionID,
+			}).Info("Closing tunnel: account out of balance")
+			// Closing both ends unblocks both copies; errChan is buffered so
+			// neither goroutine leaks.
+			upstreamConn.Close()
+			clientConn.Close()
+			break metering
+		}
+	}
+
+	return atomic.LoadInt64(&reqBytes) - reportedReq, atomic.LoadInt64(&respBytes) - reportedResp, choice, nil
 }
 
 type countingReader struct {
-	r     io.Reader
-	bytes *int64
+	r      io.Reader
+	bytes  *int64
+	budget *tunnelBudget
 }
 
 func (cr *countingReader) Read(p []byte) (int, error) {
 	n, err := cr.r.Read(p)
-	atomic.AddInt64(cr.bytes, int64(n))
+	if n > 0 {
+		atomic.AddInt64(cr.bytes, int64(n))
+		if cr.budget != nil && !cr.budget.spend(int64(n)) && err == nil {
+			// Return the bytes we did read: io.Copy writes them out before it
+			// acts on the error, so nothing is lost on the way down.
+			return n, errBudgetExhausted
+		}
+	}
 	return n, err
 }

@@ -93,6 +93,7 @@ go build -o proxy-gateway cmd/main.go
 | `REDIS_ADDR` | Redis server address | `localhost:6379` |
 | `REDIS_PASSWORD` | Redis password | `` |
 | `REDIS_DB` | Redis database number | `0` |
+| `METER_INTERVAL_SECONDS` | How often an open tunnel reports traffic and re-checks the balance | `15` |
 
 ## Database Setup
 
@@ -254,26 +255,40 @@ Response:
 
 ## Balance Checking
 
-The gateway checks user balance before allowing requests:
+The gateway checks a user's remaining traffic before a request is allowed, and
+keeps checking while a CONNECT tunnel is open.
 
-1. **Redis Cache** - Balance is cached in Redis with key `balance:cache:{username}`
-2. **Fail-Open** - If cache miss, request is allowed (balance synced by worker)
-3. **HTTP 402** - If balance ≤ 0, returns "Payment Required"
+1. **Redis cache** - remaining bytes are cached as `balance:cache:{username}` (30s TTL)
+2. **Read-through** - on a cache miss the `balances` table is consulted, which is
+   authoritative, and the cache is repopulated. Concurrent misses for one user
+   collapse into a single query.
+3. **HTTP 402** - if nothing remains, the request is refused
+4. **Fail-open only on outage** - if neither Redis nor PostgreSQL can be reached the
+   request is allowed and logged loudly. That path is unmetered, by design: an
+   unreachable database should not take the platform down.
 
-### How It Works
+### Long-lived tunnels
+
+A CONNECT tunnel can stay open for hours, so checking only at the start would let
+an empty account transfer indefinitely. Each tunnel is opened with a budget equal
+to the balance at that moment:
+
+- the budget is decremented on **every read**, so a tunnel stops within one read
+  buffer of spending it - overshoot does not scale with link speed
+- every `METER_INTERVAL_SECONDS` (default 15) the bytes moved so far are pushed to
+  the traffic queue, so the worker deducts them while the tunnel is still open,
+  and the balance is re-read - this is what stops several concurrent tunnels from
+  each spending the same allowance
+- a long session therefore produces several `traffic_logs` rows rather than one,
+  each covering a distinct slice of the transfer
 
 ```
-Request → IP Check → Auth Check → Balance Check → Forward to Proxy
-                                       │
-                                       ├── Cache Hit & Balance > 0 → Allow
-                                       ├── Cache Hit & Balance ≤ 0 → HTTP 402
-                                       └── Cache Miss → Allow (fail-open)
+Request -> IP Check -> Auth Check -> Balance Check -> Tunnel opens with a budget
+                                          |                     |
+                                          |-- > 0 -> Allow      |-- every read: budget -= n, 0 -> close
+                                          |-- <= 0 -> HTTP 402  |-- every interval: report slice, re-read balance
+                                          `-- unreachable -> Allow (logged, unmetered)
 ```
-
-The balance cache is updated by a separate worker service that:
-1. Consumes traffic logs from Redis queue
-2. Updates `used_bytes` in PostgreSQL
-3. Updates `balance:cache:{username}` in Redis
 
 ## Traffic Logging
 
