@@ -38,6 +38,11 @@ type Gateway struct {
 	meterInterval time.Duration
 }
 
+// UnlimitedRemaining mirrors auth.UnlimitedRemaining: the value a BalanceReader
+// returns when it has nothing authoritative to report and the caller should
+// carry on regardless.
+const UnlimitedRemaining = int64(math.MaxInt64)
+
 // BalanceReader reports how many bytes a user still has to spend. The auth
 // package's BalanceChecker satisfies it; it is declared here so the proxy
 // package does not depend on auth.
@@ -352,21 +357,29 @@ func (g *Gateway) newTunnelMeter(username string, logSlice func(sessionID string
 		return nil
 	}
 
-	budget := int64(math.MaxInt64)
+	var (
+		capped bool
+		budget int64
+	)
 	if g.balance != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), balanceReadTimeout)
 		remaining, err := g.balance.Remaining(ctx, username)
 		cancel()
-		if err != nil {
+		switch {
+		case err != nil:
 			g.logger.WithError(err).WithField("username", username).
 				Warn("Could not read balance for tunnel budget, tunnel will not be capped")
-		} else {
-			budget = remaining
+		case remaining >= UnlimitedRemaining:
+			// The checker could not reach anything authoritative and told us to
+			// carry on; capping at MaxInt64 would be pointless bookkeeping.
+		default:
+			capped, budget = true, remaining
 		}
 	}
 
 	return &tunnelMeter{
 		interval: g.tunnelMeterInterval(),
+		capped:   capped,
 		budget:   budget,
 		flush: func(sessionID string, reqDelta, respDelta int64) bool {
 			logSlice(sessionID, reqDelta, respDelta)
@@ -644,10 +657,17 @@ const (
 // open; returning false tears it down.
 type tunnelMeter struct {
 	interval time.Duration
-	// budget is the hard ceiling, in bytes, for this tunnel. It is enforced on
-	// every read rather than on the interval, because a tick-based check lets a
-	// fast tunnel overshoot by interval x throughput -- tens of megabytes of
-	// unpaid traffic. Enforced inline, the overshoot is one read buffer.
+	// budget is the hard ceiling, in bytes, for this tunnel, applied when
+	// capped is set. It is enforced on every read rather than on the interval,
+	// because a tick-based check lets a fast tunnel overshoot by
+	// interval x throughput -- tens of megabytes of unpaid traffic. Enforced
+	// inline, the overshoot is one read buffer.
+	//
+	// capped is separate from "budget > 0" on purpose: a budget of exactly zero
+	// must still cap the tunnel (closing it on the first read), not wave it
+	// through. The balance is re-read here rather than reused from validation,
+	// so it can legitimately have reached zero in between.
+	capped bool
 	budget int64
 	flush  func(sessionID string, reqDelta, respDelta int64) (keepOpen bool)
 }
@@ -780,7 +800,7 @@ func (g *Gateway) handleConnectTunnelWithMetrics(w http.ResponseWriter, r *http.
 	errChan := make(chan error, 2)
 
 	var budget *tunnelBudget
-	if meter != nil && meter.budget > 0 {
+	if meter != nil && meter.capped {
 		budget = &tunnelBudget{remaining: meter.budget}
 	}
 

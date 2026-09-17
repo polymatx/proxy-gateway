@@ -92,17 +92,23 @@ func newTestGateway() *Gateway {
 }
 
 // runTunnel drives one tunnel against the fake upstream, draining the client
-// end, and returns the tail the meter did not report plus any error.
-func runTunnel(t *testing.T, g *Gateway, upstream string, meter *tunnelMeter) (tailReq, tailResp int64, err error) {
+// end, and returns the tail the meter did not report plus any error. When
+// stopAfter is non-zero the client hangs up after that long, which is how a
+// test ends a tunnel nothing else would close.
+func runTunnel(t *testing.T, g *Gateway, upstream string, meter *tunnelMeter, stopAfter time.Duration) (tailReq, tailResp int64, err error) {
 	t.Helper()
 	clientSide, serverSide := net.Pipe()
-	defer clientSide.Close()
 
-	done := make(chan struct{})
+	drained := make(chan struct{})
 	go func() {
-		defer close(done)
+		defer close(drained)
 		io.Copy(io.Discard, clientSide)
 	}()
+
+	if stopAfter > 0 {
+		timer := time.AfterFunc(stopAfter, func() { clientSide.Close() })
+		defer timer.Stop()
+	}
 
 	req, _ := http.NewRequest(http.MethodConnect, "//example.com:443", nil)
 	req.Host = "example.com:443"
@@ -112,7 +118,7 @@ func runTunnel(t *testing.T, g *Gateway, upstream string, meter *tunnelMeter) (t
 
 	tailReq, tailResp, _, err = g.handleConnectTunnelWithMetrics(w, req, choice, nil, meter)
 	clientSide.Close()
-	<-done
+	<-drained
 	return tailReq, tailResp, err
 }
 
@@ -131,6 +137,7 @@ func TestTunnelClosesWhenBudgetIsSpent(t *testing.T) {
 
 	meter := &tunnelMeter{
 		interval: time.Hour, // never ticks: this test is about inline enforcement
+		capped:   true,
 		budget:   budget,
 		flush: func(sessionID string, reqDelta, respDelta int64) bool {
 			mu.Lock()
@@ -141,7 +148,7 @@ func TestTunnelClosesWhenBudgetIsSpent(t *testing.T) {
 	}
 
 	start := time.Now()
-	tailReq, tailResp, err := runTunnel(t, g, addr, meter)
+	tailReq, tailResp, err := runTunnel(t, g, addr, meter, 0)
 	elapsed := time.Since(start)
 
 	if err != nil {
@@ -187,30 +194,19 @@ func TestTunnelBudgetIsSharedAcrossDirections(t *testing.T) {
 	}
 }
 
-// Without a meter the behaviour must be exactly what it was before: one tunnel,
-// one set of totals, nothing reported mid-flight.
+// Without a meter the behaviour must be exactly what it was before: nothing is
+// reported mid-flight, and the full totals come back when a side hangs up.
 func TestTunnelWithoutMeterReturnsFullTotals(t *testing.T) {
 	addr, stop := fakeUpstream(t)
 	defer stop()
 
 	g := newTestGateway()
-	done := make(chan struct{})
-	var tailResp int64
-	go func() {
-		defer close(done)
-		_, tailResp, _ = runTunnel(t, g, addr, nil)
-	}()
-
-	select {
-	case <-done:
-		if tailResp <= 0 {
-			t.Fatalf("expected the unmetered tunnel to report its total, got %d", tailResp)
-		}
-	case <-time.After(2 * time.Second):
-		// Expected: with no meter the tunnel stays open until a side closes.
-		// The deferred client close in runTunnel ends it; this branch only
-		// guards against the test hanging forever.
-		t.Log("unmetered tunnel still open after 2s, as designed")
+	_, tailResp, err := runTunnel(t, g, addr, nil, 150*time.Millisecond)
+	if err != nil {
+		t.Fatalf("tunnel returned error: %v", err)
+	}
+	if tailResp <= 0 {
+		t.Fatalf("expected the unmetered tunnel to report its total, got %d", tailResp)
 	}
 }
 
@@ -242,5 +238,55 @@ func TestNewTunnelMeterFailsOpenWhenBalanceUnreadable(t *testing.T) {
 	}
 	if !meter.flush("s", 1024, 1024) {
 		t.Fatal("meter closed a tunnel because the balance could not be read")
+	}
+}
+
+// A balance that reached zero between validation and the tunnel opening must
+// still cap it. Treating "budget of 0" as "no budget" would have handed that
+// user an uncapped tunnel -- exactly the hole the budget exists to close.
+func TestZeroBalanceStillCapsTheTunnel(t *testing.T) {
+	addr, stop := fakeUpstream(t)
+	defer stop()
+
+	g := newTestGateway()
+	g.trafficLogger = &traffic.Logger{}
+	g.balance = &stubBalance{remaining: 0}
+
+	meter := g.newTunnelMeter("someone", func(string, int64, int64) {})
+	if meter == nil {
+		t.Fatal("expected a meter")
+	}
+	if !meter.capped {
+		t.Fatal("a zero balance produced an uncapped tunnel")
+	}
+	if meter.budget != 0 {
+		t.Fatalf("budget = %d, want 0", meter.budget)
+	}
+
+	// No stopAfter: if the budget does not close this, the test hangs and the
+	// package timeout reports it.
+	if _, _, err := runTunnel(t, g, addr, meter, 0); err != nil {
+		t.Fatalf("tunnel returned error: %v", err)
+	}
+}
+
+// An unreadable balance must leave the tunnel uncapped rather than capped at a
+// nonsense figure.
+func TestUnreadableBalanceLeavesTunnelUncapped(t *testing.T) {
+	g := newTestGateway()
+	g.trafficLogger = &traffic.Logger{}
+
+	for name, b := range map[string]*stubBalance{
+		"error":     {err: errors.New("redis down")},
+		"unlimited": {remaining: UnlimitedRemaining},
+	} {
+		g.balance = b
+		meter := g.newTunnelMeter("someone", func(string, int64, int64) {})
+		if meter == nil {
+			t.Fatalf("%s: expected a meter", name)
+		}
+		if meter.capped {
+			t.Fatalf("%s: tunnel was capped despite no authoritative balance", name)
+		}
 	}
 }
