@@ -256,14 +256,25 @@ func (g *Gateway) HandleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Build the actual proxy URL using the template
-	proxyURL := proxyData.BuildProxyURL(country, sessionID, duration)
+	choice := upstreamChoice{URL: proxyData.BuildProxyURL(country, sessionID, duration), SessionID: sessionID}
+
+	// Nobody asked for a generated session to stick, so a retry may take a
+	// fresh exit node instead of the one that just refused us. A client that
+	// supplied its own session ID keeps it, even at the cost of a 502.
+	var rotate func() upstreamChoice
+	if generatedSession {
+		rotate = func() upstreamChoice {
+			sid := g.generateSessionID()
+			return upstreamChoice{URL: proxyData.BuildProxyURL(country, sid, duration), SessionID: sid}
+		}
+	}
 
 	g.logger.WithFields(logrus.Fields{
 		"target":     r.Host,
 		"proxy_slug": proxyData.Slug,
 	}).Debug("Handling CONNECT request")
 
-	requestBytes, responseBytes, err := g.handleConnectTunnelWithMetrics(w, r, proxyURL)
+	requestBytes, responseBytes, used, err := g.handleConnectTunnelWithMetrics(w, r, choice, rotate)
 	if err != nil {
 		g.logger.WithError(err).Error("Failed to handle CONNECT")
 		http.Error(w, "Proxy Error", http.StatusBadGateway)
@@ -280,7 +291,7 @@ func (g *Gateway) HandleConnect(w http.ResponseWriter, r *http.Request) {
 			TargetMethod:  "CONNECT",
 			ProxySlug:     proxyData.Slug,
 			Country:       country,
-			SessionID:     sessionID,
+			SessionID:     used.SessionID,
 			Duration:      duration,
 			StatusCode:    200,
 			ClientIP:      clientIP,
@@ -578,46 +589,60 @@ func (g *Gateway) dialUpstreamTunnel(proxyURL *url.URL, target string) (net.Conn
 	return upstreamConn, br, nil
 }
 
-func (g *Gateway) handleConnectTunnelWithMetrics(w http.ResponseWriter, r *http.Request, proxyURLString string) (requestBytes, responseBytes int64, err error) {
-	proxyURL, err := url.Parse(proxyURLString)
-	if err != nil {
-		return 0, 0, fmt.Errorf("invalid proxy URL: %v", err)
-	}
+// upstreamChoice is one concrete upstream URL together with the session ID
+// baked into it, so the caller can log which session actually carried traffic.
+type upstreamChoice struct {
+	URL       string
+	SessionID string
+}
 
+// handleConnectTunnelWithMetrics establishes the tunnel and pipes bytes.
+// rotate, when non-nil, is consulted before each retry to pick a different
+// upstream session: a request that was refused three times on one exit node
+// is usually that node's problem, not a momentary blip, so knocking on the
+// same door again rarely helps. Sticky sessions pass nil and keep their exit.
+func (g *Gateway) handleConnectTunnelWithMetrics(w http.ResponseWriter, r *http.Request, choice upstreamChoice, rotate func() upstreamChoice) (requestBytes, responseBytes int64, used upstreamChoice, err error) {
 	var (
 		upstreamConn net.Conn
 		br           *bufio.Reader
 	)
 	for attempt := 1; ; attempt++ {
+		proxyURL, perr := url.Parse(choice.URL)
+		if perr != nil {
+			return 0, 0, choice, fmt.Errorf("invalid proxy URL: %v", perr)
+		}
 		upstreamConn, br, err = g.dialUpstreamTunnel(proxyURL, r.Host)
 		if err == nil {
 			if attempt > 1 {
-				g.logger.WithFields(logrus.Fields{"attempt": attempt, "target": r.Host}).Info("Upstream CONNECT succeeded after retry")
+				g.logger.WithFields(logrus.Fields{"attempt": attempt, "target": r.Host, "rotated": rotate != nil}).Info("Upstream CONNECT succeeded after retry")
 			}
 			break
 		}
 		var te *tunnelErr
 		if !errors.As(err, &te) || !te.transient || attempt >= connectAttempts || r.Context().Err() != nil {
-			return 0, 0, err
+			return 0, 0, choice, err
 		}
-		g.logger.WithError(err).WithFields(logrus.Fields{"attempt": attempt, "target": r.Host}).Warn("Upstream CONNECT failed, retrying")
+		g.logger.WithError(err).WithFields(logrus.Fields{"attempt": attempt, "target": r.Host, "rotated": rotate != nil}).Warn("Upstream CONNECT failed, retrying")
 		time.Sleep(connectRetryBase * time.Duration(1<<(attempt-1)))
+		if rotate != nil {
+			choice = rotate()
+		}
 	}
 	defer upstreamConn.Close()
 
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
-		return 0, 0, fmt.Errorf("hijacking not supported")
+		return 0, 0, choice, fmt.Errorf("hijacking not supported")
 	}
 
 	clientConn, _, err := hijacker.Hijack()
 	if err != nil {
-		return 0, 0, fmt.Errorf("failed to hijack connection: %v", err)
+		return 0, 0, choice, fmt.Errorf("failed to hijack connection: %v", err)
 	}
 	defer clientConn.Close()
 
 	if _, err := clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
-		return 0, 0, fmt.Errorf("failed to send 200: %v", err)
+		return 0, 0, choice, fmt.Errorf("failed to send 200: %v", err)
 	}
 
 	var reqBytes, respBytes int64
@@ -635,7 +660,7 @@ func (g *Gateway) handleConnectTunnelWithMetrics(w http.ResponseWriter, r *http.
 
 	<-errChan
 
-	return atomic.LoadInt64(&reqBytes), atomic.LoadInt64(&respBytes), nil
+	return atomic.LoadInt64(&reqBytes), atomic.LoadInt64(&respBytes), choice, nil
 }
 
 type countingReader struct {
