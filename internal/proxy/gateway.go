@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"crypto/tls"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -505,49 +506,104 @@ func (cw *countingWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
+// tunnelErr classifies a failure to establish the upstream CONNECT tunnel.
+// A transient failure happens before a single byte has been written to the
+// client, so the caller may retry it against the same upstream without any
+// client-visible side effect.
+type tunnelErr struct {
+	err       error
+	transient bool
+}
+
+func (e *tunnelErr) Error() string { return e.err.Error() }
+func (e *tunnelErr) Unwrap() error { return e.err }
+
+const (
+	// The upstream residential provider drops a small share of CONNECT
+	// handshakes mid-flight (EOF while reading its response). One or two
+	// retries recover almost all of them; more only delays the 502.
+	connectAttempts  = 3
+	connectRetryBase = 100 * time.Millisecond
+)
+
+// dialUpstreamTunnel opens the upstream proxy connection and completes the
+// CONNECT handshake for target. On success the returned reader must be used
+// for upstream->client copying: it may already hold bytes read past the
+// response headers.
+func (g *Gateway) dialUpstreamTunnel(proxyURL *url.URL, target string) (net.Conn, *bufio.Reader, error) {
+	// No timeout for dial - bridge mode
+	upstreamConn, err := net.Dial("tcp", proxyURL.Host)
+	if err != nil {
+		return nil, nil, &tunnelErr{fmt.Errorf("failed to connect to upstream proxy: %w", err), true}
+	}
+
+	connectReq := &http.Request{
+		Method: "CONNECT",
+		URL:    &url.URL{Opaque: target},
+		Host:   target,
+		Header: make(http.Header),
+	}
+	if proxyURL.User != nil {
+		username := proxyURL.User.Username()
+		password, _ := proxyURL.User.Password()
+		auth := username + ":" + password
+		connectReq.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(auth)))
+	}
+
+	if err := connectReq.Write(upstreamConn); err != nil {
+		upstreamConn.Close()
+		return nil, nil, &tunnelErr{fmt.Errorf("failed to write CONNECT: %w", err), true}
+	}
+
+	br := bufio.NewReader(upstreamConn)
+	resp, err := http.ReadResponse(br, connectReq)
+	if err != nil {
+		upstreamConn.Close()
+		// Typically io.ErrUnexpectedEOF: the upstream accepted the TCP
+		// connection and then dropped it. This is the case retries exist for.
+		return nil, nil, &tunnelErr{fmt.Errorf("failed to read CONNECT response: %w", err), true}
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		resp.Body.Close()
+		upstreamConn.Close()
+		// 5xx is the provider having a bad moment; 407/403/4xx is a decision
+		// about this request and will not change on a retry.
+		return nil, nil, &tunnelErr{
+			fmt.Errorf("upstream rejected CONNECT: %d %s", resp.StatusCode, strings.TrimSpace(string(body))),
+			resp.StatusCode >= 500,
+		}
+	}
+	resp.Body.Close() // a 2xx to CONNECT carries no body
+	return upstreamConn, br, nil
+}
+
 func (g *Gateway) handleConnectTunnelWithMetrics(w http.ResponseWriter, r *http.Request, proxyURLString string) (requestBytes, responseBytes int64, err error) {
 	proxyURL, err := url.Parse(proxyURLString)
 	if err != nil {
 		return 0, 0, fmt.Errorf("invalid proxy URL: %v", err)
 	}
 
-	// No timeout for dial - bridge mode
-	upstreamConn, err := net.Dial("tcp", proxyURL.Host)
-	if err != nil {
-		return 0, 0, fmt.Errorf("failed to connect to upstream proxy: %v", err)
+	var (
+		upstreamConn net.Conn
+		br           *bufio.Reader
+	)
+	for attempt := 1; ; attempt++ {
+		upstreamConn, br, err = g.dialUpstreamTunnel(proxyURL, r.Host)
+		if err == nil {
+			if attempt > 1 {
+				g.logger.WithFields(logrus.Fields{"attempt": attempt, "target": r.Host}).Info("Upstream CONNECT succeeded after retry")
+			}
+			break
+		}
+		var te *tunnelErr
+		if !errors.As(err, &te) || !te.transient || attempt >= connectAttempts || r.Context().Err() != nil {
+			return 0, 0, err
+		}
+		g.logger.WithError(err).WithFields(logrus.Fields{"attempt": attempt, "target": r.Host}).Warn("Upstream CONNECT failed, retrying")
+		time.Sleep(connectRetryBase * time.Duration(1<<(attempt-1)))
 	}
 	defer upstreamConn.Close()
-
-	connectReq := &http.Request{
-		Method: "CONNECT",
-		URL:    &url.URL{Opaque: r.Host},
-		Host:   r.Host,
-		Header: make(http.Header),
-	}
-
-	if proxyURL.User != nil {
-		username := proxyURL.User.Username()
-		password, _ := proxyURL.User.Password()
-		auth := username + ":" + password
-		basicAuth := "Basic " + base64.StdEncoding.EncodeToString([]byte(auth))
-		connectReq.Header.Set("Proxy-Authorization", basicAuth)
-	}
-
-	if err := connectReq.Write(upstreamConn); err != nil {
-		return 0, 0, fmt.Errorf("failed to write CONNECT: %v", err)
-	}
-
-	br := bufio.NewReader(upstreamConn)
-	resp, err := http.ReadResponse(br, connectReq)
-	if err != nil {
-		return 0, 0, fmt.Errorf("failed to read CONNECT response: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return 0, 0, fmt.Errorf("upstream rejected CONNECT: %d %s", resp.StatusCode, string(body))
-	}
 
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
@@ -568,14 +624,12 @@ func (g *Gateway) handleConnectTunnelWithMetrics(w http.ResponseWriter, r *http.
 	errChan := make(chan error, 2)
 
 	go func() {
-		n, err := io.Copy(upstreamConn, &countingReader{r: clientConn, bytes: &reqBytes})
-		_ = n
+		_, err := io.Copy(upstreamConn, &countingReader{r: clientConn, bytes: &reqBytes})
 		errChan <- err
 	}()
 
 	go func() {
-		n, err := io.Copy(clientConn, &countingReader{r: upstreamConn, bytes: &respBytes})
-		_ = n
+		_, err := io.Copy(clientConn, &countingReader{r: br, bytes: &respBytes})
 		errChan <- err
 	}()
 
