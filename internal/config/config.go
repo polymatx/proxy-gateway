@@ -21,6 +21,14 @@ type Config struct {
 	// believed. Empty disables the feature entirely. A header from anyone else
 	// is ignored, because it is an unverifiable claim about who the client is.
 	ProxyProtocolFrom string
+	// Health checking. Detection is passive, from real request outcomes;
+	// probes only re-test providers already believed to be down, so a healthy
+	// provider costs no upstream traffic.
+	HealthEnabled       bool
+	HealthProbeInterval time.Duration
+	HealthProbeTarget   string
+	HealthFallThreshold int
+	HealthRiseThreshold int
 }
 
 func Load() *Config {
@@ -30,6 +38,12 @@ func Load() *Config {
 	if err != nil || meterSeconds <= 0 {
 		meterSeconds = 15
 	}
+	healthEnabled, _ := strconv.ParseBool(getEnv("HEALTH_CHECK_ENABLED", "true"))
+	probeSeconds := atoiOr(getEnv("HEALTH_PROBE_INTERVAL_SECONDS", "30"), 30)
+	// Named after HAProxy's fall/rise, and defaulted to match the relay's
+	// backend, so the two layers agree on what "down" means.
+	fall := atoiOr(getEnv("HEALTH_FALL", "3"), 3)
+	rise := atoiOr(getEnv("HEALTH_RISE", "2"), 2)
 
 	return &Config{
 		Port:              getEnv("PORT", "8080"),
@@ -41,7 +55,20 @@ func Load() *Config {
 		RedisDB:           redisDB,
 		MeterInterval:     time.Duration(meterSeconds) * time.Second,
 		ProxyProtocolFrom: getEnv("PROXY_PROTOCOL_FROM", ""),
+
+		HealthEnabled:       healthEnabled,
+		HealthProbeInterval: time.Duration(probeSeconds) * time.Second,
+		HealthProbeTarget:   getEnv("HEALTH_PROBE_TARGET", "www.google.com:443"),
+		HealthFallThreshold: fall,
+		HealthRiseThreshold: rise,
 	}
+}
+
+func atoiOr(raw string, fallback int) int {
+	if v, err := strconv.Atoi(raw); err == nil && v > 0 {
+		return v
+	}
+	return fallback
 }
 
 func getEnv(key, defaultValue string) string {

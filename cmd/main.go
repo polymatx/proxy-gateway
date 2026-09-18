@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -128,8 +129,34 @@ func main() {
 		}
 	}()
 
+	var health *proxy.Health
+	if cfg.HealthEnabled {
+		health = proxy.NewHealth(proxy.HealthConfig{
+			FailThreshold: cfg.HealthFallThreshold,
+			RiseThreshold: cfg.HealthRiseThreshold,
+			ProbeTarget:   cfg.HealthProbeTarget,
+		}, logger)
+		proxyProvider.SetHealth(health, logger)
+
+		healthCtx, stopHealth := context.WithCancel(context.Background())
+		defer stopHealth()
+		go health.RunProbes(healthCtx, proxyProvider, cfg.HealthProbeInterval)
+
+		logger.WithFields(logrus.Fields{
+			"fall":           cfg.HealthFallThreshold,
+			"rise":           cfg.HealthRiseThreshold,
+			"probe_interval": cfg.HealthProbeInterval.String(),
+			"probe_target":   cfg.HealthProbeTarget,
+		}).Info("Provider health checking enabled")
+	} else {
+		logger.Warn("Provider health checking disabled; a failing upstream will keep receiving its share of traffic")
+	}
+
 	proxyGateway := proxy.NewGateway(proxyProvider, ipValidator, logger)
 	proxyGateway.SetMeterInterval(cfg.MeterInterval)
+	if health != nil {
+		proxyGateway.SetHealth(health)
+	}
 	if balanceChecker != nil {
 		// Guarded rather than passed unconditionally: a nil *BalanceChecker
 		// stored in the interface would be non-nil to the gateway and panic on
@@ -162,10 +189,17 @@ func main() {
 			queueLen, _ = trafficLogger.GetQueueLength(r.Context())
 		}
 
+		providers := "{}"
+		if health != nil {
+			if b, err := json.Marshal(health.Snapshot()); err == nil {
+				providers = string(b)
+			}
+		}
+
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, `{"status":"healthy","proxy_count":%d,"user_count":%d,"queue_length":%d}`,
-			proxyCount, ipValidator.GetUserCount(), queueLen)
+		fmt.Fprintf(w, `{"status":"healthy","proxy_count":%d,"user_count":%d,"queue_length":%d,"providers":%s}`,
+			proxyCount, ipValidator.GetUserCount(), queueLen, providers)
 	}).Methods("GET")
 
 	router.PathPrefix("/").HandlerFunc(proxyGateway.HandleHTTP)

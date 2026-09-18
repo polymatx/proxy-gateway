@@ -95,6 +95,11 @@ go build -o proxy-gateway cmd/main.go
 | `REDIS_DB` | Redis database number | `0` |
 | `METER_INTERVAL_SECONDS` | How often an open tunnel reports traffic and re-checks the balance | `15` |
 | `PROXY_PROTOCOL_FROM` | Comma-separated IPs/CIDRs whose PROXY protocol header is believed | `` (disabled) |
+| `HEALTH_CHECK_ENABLED` | Skip providers that are failing | `true` |
+| `HEALTH_FALL` | Consecutive failed requests before a provider is taken out | `3` |
+| `HEALTH_RISE` | Consecutive successes before it comes back | `2` |
+| `HEALTH_PROBE_INTERVAL_SECONDS` | How often a provider believed down is re-tested | `30` |
+| `HEALTH_PROBE_TARGET` | Host:port the recovery probe opens a tunnel to | `www.google.com:443` |
 
 ## Database Setup
 
@@ -253,6 +258,42 @@ Response:
   "queue_length": 42
 }
 ```
+
+## Provider Health
+
+Selection is a uniform random pick, but only among providers that are currently
+working. Both pools (`is_global` true and false) are filtered independently.
+
+**Detection is passive.** A request only counts as a failure once the gateway
+has exhausted its CONNECT retries, so a provider that is merely flaky -- which
+residential upstreams routinely are -- does not get taken out. `HEALTH_FALL`
+consecutive failures marks one down; `HEALTH_RISE` consecutive successes brings
+it back. The names and defaults match the relay's HAProxy backend so the two
+layers agree on what "down" means.
+
+**Probing is narrow.** Only providers already believed to be down are probed,
+every `HEALTH_PROBE_INTERVAL_SECONDS`. A healthy provider is never probed, so
+health checking costs no upstream traffic in the steady state; the probe itself
+opens a CONNECT tunnel and closes it without transferring anything.
+
+**It fails open.** If every provider in a pool is marked unhealthy, traffic goes
+to one of them anyway rather than returning 503. Health is an inference, and an
+inference that can refuse all traffic is more dangerous than the failure it
+guards against -- a blocked probe target must not be able to take the platform
+down. That case is logged as a warning.
+
+A sticky session whose provider goes down is moved to another one: stickiness is
+a preference, not a reason to send someone to a provider believed broken.
+
+State is per-pod and in-memory, like HAProxy's, so each replica forms its own
+view. `GET /health` reports it:
+
+```json
+{"status":"healthy","proxy_count":4,"user_count":8,"queue_length":0,
+ "providers":{"ipweb-global":true,"goproxy-global":true}}
+```
+
+A provider only appears once it has been used or probed.
 
 ## Client Addresses
 

@@ -10,6 +10,7 @@ import (
 
 	"github.com/biter777/countries"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/sirupsen/logrus"
 )
 
 type ProxyData struct {
@@ -99,6 +100,45 @@ type ProxyProvider struct {
 	proxyMap     map[string]*ProxyData
 	mu           sync.RWMutex
 	sessionCache *SessionCache
+	health       *Health
+	logger       *logrus.Logger
+}
+
+// SetHealth makes selection skip providers currently believed to be down.
+func (p *ProxyProvider) SetHealth(h *Health, logger *logrus.Logger) {
+	p.health = h
+	p.logger = logger
+}
+
+// pick chooses uniformly from the candidates that are currently healthy.
+//
+// If none of them are, it falls back to the whole set rather than returning
+// nothing. Health is an inference, and a wrong inference that refuses every
+// request is worse than one that sends traffic to a provider that might work:
+// a probe target being blocked must not be able to take the platform down.
+func (p *ProxyProvider) pick(candidates []*ProxyData, pool string) *ProxyData {
+	if len(candidates) == 0 {
+		return nil
+	}
+	if p.health == nil {
+		return candidates[rand.Intn(len(candidates))]
+	}
+
+	healthy := make([]*ProxyData, 0, len(candidates))
+	for _, c := range candidates {
+		if p.health.IsHealthy(c.Slug) {
+			healthy = append(healthy, c)
+		}
+	}
+	if len(healthy) > 0 {
+		return healthy[rand.Intn(len(healthy))]
+	}
+
+	if p.logger != nil {
+		p.logger.WithField("pool", pool).
+			Warn("Every provider in this pool is marked unhealthy; using them anyway rather than refusing traffic")
+	}
+	return candidates[rand.Intn(len(candidates))]
 }
 
 func NewProxyProvider(pool *pgxpool.Pool) *ProxyProvider {
@@ -178,52 +218,41 @@ func (p *ProxyProvider) GetProxyBySlug(slug string) *ProxyData {
 
 func (p *ProxyProvider) GetRandomProxy() *ProxyData {
 	p.mu.RLock()
-	defer p.mu.RUnlock()
-
-	if len(p.proxies) == 0 {
-		return nil
+	candidates := make([]*ProxyData, 0, len(p.proxies))
+	for i := range p.proxies {
+		candidates = append(candidates, &p.proxies[i])
 	}
+	p.mu.RUnlock()
 
-	idx := rand.Intn(len(p.proxies))
-	return &p.proxies[idx]
+	return p.pick(candidates, "any")
 }
 
-// GetRandomGlobalProxy returns a random proxy where is_global = true
+// GetRandomGlobalProxy returns a random healthy proxy where is_global = true
 func (p *ProxyProvider) GetRandomGlobalProxy() *ProxyData {
 	p.mu.RLock()
-	defer p.mu.RUnlock()
-
 	var globalProxies []*ProxyData
 	for i := range p.proxies {
 		if p.proxies[i].IsGlobal {
 			globalProxies = append(globalProxies, &p.proxies[i])
 		}
 	}
+	p.mu.RUnlock()
 
-	if len(globalProxies) == 0 {
-		return nil
-	}
-
-	return globalProxies[rand.Intn(len(globalProxies))]
+	return p.pick(globalProxies, "global")
 }
 
-// GetRandomNonGlobalProxy returns a random proxy where is_global = false
+// GetRandomNonGlobalProxy returns a random healthy proxy where is_global = false
 func (p *ProxyProvider) GetRandomNonGlobalProxy() *ProxyData {
 	p.mu.RLock()
-	defer p.mu.RUnlock()
-
 	var nonGlobalProxies []*ProxyData
 	for i := range p.proxies {
 		if !p.proxies[i].IsGlobal {
 			nonGlobalProxies = append(nonGlobalProxies, &p.proxies[i])
 		}
 	}
+	p.mu.RUnlock()
 
-	if len(nonGlobalProxies) == 0 {
-		return nil
-	}
-
-	return nonGlobalProxies[rand.Intn(len(nonGlobalProxies))]
+	return p.pick(nonGlobalProxies, "regional")
 }
 
 func (p *ProxyProvider) GetProxyCount() int {
@@ -255,11 +284,19 @@ func (p *ProxyProvider) GetProxyForSession(ctx context.Context, username, countr
 	if p.sessionCache != nil {
 		cachedSlug, err := p.sessionCache.GetProxySlug(ctx, username, country, sessionID, useGlobal)
 		if err == nil && cachedSlug != "" {
-			// Cache hit - return the same proxy
+			// Cache hit - return the same proxy, unless it has since been
+			// marked down. Stickiness is a preference; sending the customer to
+			// a provider we believe is broken is not honouring it.
 			if proxy := p.GetProxyBySlug(cachedSlug); proxy != nil {
-				return proxy
+				if p.health == nil || p.health.IsHealthy(cachedSlug) {
+					return proxy
+				}
+				if p.logger != nil {
+					p.logger.WithField("proxy_slug", cachedSlug).
+						Info("Sticky session's provider is unhealthy; moving the session to another")
+				}
 			}
-			// Cached proxy no longer exists, fall through to select new one
+			// Cached proxy is gone or unhealthy, fall through to select a new one
 		}
 	}
 

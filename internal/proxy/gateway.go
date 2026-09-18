@@ -36,6 +36,7 @@ type Gateway struct {
 	trafficLogger *traffic.Logger
 	balance       BalanceReader
 	meterInterval time.Duration
+	health        *Health
 }
 
 // UnlimitedRemaining mirrors auth.UnlimitedRemaining: the value a BalanceReader
@@ -100,6 +101,24 @@ func (g *Gateway) SetTrafficLogger(tl *traffic.Logger) {
 // an empty account from transferring indefinitely inside a single tunnel.
 func (g *Gateway) SetBalanceChecker(b BalanceReader) {
 	g.balance = b
+}
+
+// SetHealth lets request outcomes feed provider health. Real traffic is the
+// detection signal: a failure here means the gateway already retried and still
+// could not get through, so it says something a single probe would not.
+func (g *Gateway) SetHealth(h *Health) {
+	g.health = h
+}
+
+func (g *Gateway) recordOutcome(slug string, err error) {
+	if g.health == nil || slug == "" {
+		return
+	}
+	if err != nil {
+		g.health.RecordFailure(slug)
+		return
+	}
+	g.health.RecordSuccess(slug)
 }
 
 // SetMeterInterval sets how often an open tunnel reports the bytes it has moved
@@ -206,6 +225,7 @@ func (g *Gateway) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 	requestBytes += g.estimateHeaderSize(r.Header)
 
 	responseBytes, statusCode, err := g.forwardRequestWithMetrics(w, r, proxyURL)
+	g.recordOutcome(proxyData.Slug, err)
 	if err != nil {
 		g.logger.WithFields(logrus.Fields{
 			"error":       err.Error(),
@@ -335,8 +355,9 @@ func (g *Gateway) HandleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 
 	requestBytes, responseBytes, used, err := g.handleConnectTunnelWithMetrics(w, r, choice, rotate, g.newTunnelMeter(username, logSlice))
+	g.recordOutcome(proxyData.Slug, err)
 	if err != nil {
-		g.logger.WithError(err).Error("Failed to handle CONNECT")
+		g.logger.WithError(err).WithField("proxy_slug", proxyData.Slug).Error("Failed to handle CONNECT")
 		http.Error(w, "Proxy Error", http.StatusBadGateway)
 		return
 	}
