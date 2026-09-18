@@ -94,6 +94,7 @@ go build -o proxy-gateway cmd/main.go
 | `REDIS_PASSWORD` | Redis password | `` |
 | `REDIS_DB` | Redis database number | `0` |
 | `METER_INTERVAL_SECONDS` | How often an open tunnel reports traffic and re-checks the balance | `15` |
+| `PROXY_PROTOCOL_FROM` | Comma-separated IPs/CIDRs whose PROXY protocol header is believed | `` (disabled) |
 
 ## Database Setup
 
@@ -252,6 +253,27 @@ Response:
   "queue_length": 42
 }
 ```
+
+## Client Addresses
+
+Traffic normally reaches the gateway through a TCP relay, which means the peer
+address on every connection is the relay's, not the customer's. Set
+`PROXY_PROTOCOL_FROM` to the relay's address and configure the relay to send a
+PROXY protocol v1 header (`send-proxy` in HAProxy) to recover the real one.
+
+Two things are deliberate:
+
+- **A header is only believed from a listed peer.** It is an unverifiable claim
+  about who the client is, so honouring one from an arbitrary peer would let
+  anyone reaching the port forge their address in `traffic_logs`.
+- **A missing header is not an error.** The gateway can therefore be deployed
+  before the relay is switched over, and direct connections keep working.
+
+When a header is present it wins over `X-Forwarded-For` and friends: this is a
+forward proxy, so those headers are written by the very client being identified.
+
+A v2 (binary) header is refused rather than skipped, since ignoring it would
+leave its body in the stream and corrupt the request behind it.
 
 ## Balance Checking
 

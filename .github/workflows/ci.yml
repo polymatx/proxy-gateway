@@ -4,13 +4,43 @@ on:
   push:
     branches: [main]
     tags: ['v*']
+  pull_request:
+    branches: [main]
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Verify gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      # -race matters here specifically: the tunnel meter shares counters and a
+      # budget between two copy goroutines, so a data race would be a billing
+      # bug that only shows under load.
+      - name: Test
+        run: go test -race -timeout 120s ./...
+
   build:
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read

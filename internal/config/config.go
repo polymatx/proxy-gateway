@@ -17,6 +17,10 @@ type Config struct {
 	// MeterInterval is how often an open CONNECT tunnel reports the bytes it
 	// has moved and is re-checked against the user's balance.
 	MeterInterval time.Duration
+	// ProxyProtocolFrom lists the IPs and CIDRs whose PROXY protocol header is
+	// believed. Empty disables the feature entirely. A header from anyone else
+	// is ignored, because it is an unverifiable claim about who the client is.
+	ProxyProtocolFrom string
 }
 
 func Load() *Config {
@@ -28,14 +32,15 @@ func Load() *Config {
 	}
 
 	return &Config{
-		Port:          getEnv("PORT", "8080"),
-		PostgresURI:   getEnv("POSTGRES_URI", ""),
-		LogLevel:      getEnv("LOG_LEVEL", "info"),
-		EnableTraffic: enableTraffic,
-		RedisAddr:     getEnv("REDIS_ADDR", "localhost:6379"),
-		RedisPassword: getEnv("REDIS_PASSWORD", ""),
-		RedisDB:       redisDB,
-		MeterInterval: time.Duration(meterSeconds) * time.Second,
+		Port:              getEnv("PORT", "8080"),
+		PostgresURI:       getEnv("POSTGRES_URI", ""),
+		LogLevel:          getEnv("LOG_LEVEL", "info"),
+		EnableTraffic:     enableTraffic,
+		RedisAddr:         getEnv("REDIS_ADDR", "localhost:6379"),
+		RedisPassword:     getEnv("REDIS_PASSWORD", ""),
+		RedisDB:           redisDB,
+		MeterInterval:     time.Duration(meterSeconds) * time.Second,
+		ProxyProtocolFrom: getEnv("PROXY_PROTOCOL_FROM", ""),
 	}
 }
 

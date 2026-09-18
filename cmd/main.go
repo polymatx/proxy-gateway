@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -11,6 +12,7 @@ import (
 	"proxy-gateway/internal/config"
 	"proxy-gateway/internal/database"
 	"proxy-gateway/internal/proxy"
+	"proxy-gateway/internal/proxyproto"
 	"proxy-gateway/internal/traffic"
 	"runtime"
 	"strings"
@@ -181,8 +183,17 @@ func main() {
 		}
 	})
 
+	trustedProxies, err := proxyproto.ParseTrusted(cfg.ProxyProtocolFrom)
+	if err != nil {
+		logger.WithError(err).Fatal("Invalid PROXY_PROTOCOL_FROM")
+	}
+
+	listener, err := net.Listen("tcp", ":"+cfg.Port)
+	if err != nil {
+		logger.WithError(err).Fatal("Failed to listen")
+	}
+
 	server := &http.Server{
-		Addr:    ":" + cfg.Port,
 		Handler: topLevelHandler,
 		// No timeouts - pure bridge mode
 		ReadTimeout:       0,
@@ -191,9 +202,23 @@ func main() {
 		IdleTimeout:       0,
 	}
 
+	if len(trustedProxies) > 0 {
+		// The header is read off the connection, so the handler has to reach
+		// the connection to ask about it; ConnContext is the only hook that
+		// runs early enough to make that possible.
+		listener = proxyproto.NewListener(listener, trustedProxies)
+		server.ConnContext = func(ctx context.Context, c net.Conn) context.Context {
+			return proxyproto.WithConn(ctx, c)
+		}
+		logger.WithField("trusted", cfg.ProxyProtocolFrom).
+			Info("PROXY protocol enabled; client addresses will come from trusted peers")
+	} else {
+		logger.Warn("PROXY_PROTOCOL_FROM not set; every request through the relay will be logged with the relay's address")
+	}
+
 	go func() {
 		logger.WithField("port", cfg.Port).Info("Server starting (no timeouts)")
-		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.WithError(err).Fatal("Server failed to start")
 		}
 	}()

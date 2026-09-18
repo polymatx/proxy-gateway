@@ -9,6 +9,8 @@ import (
 	"sync"
 	"time"
 
+	"proxy-gateway/internal/proxyproto"
+
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/sirupsen/logrus"
 )
@@ -242,6 +244,14 @@ func (v *IPValidator) ValidateRequest(r *http.Request) (bool, string) {
 }
 
 func getClientIP(r *http.Request) string {
+	// A trusted upstream speaking PROXY protocol has already told us who the
+	// client is, on the connection itself. That beats any header: this is a
+	// forward proxy, so X-Forwarded-For and friends are written by the very
+	// client we are trying to identify.
+	if ip, ok := proxyproto.RealClientIPFromContext(r.Context()); ok {
+		return ip
+	}
+
 	xoff := r.Header.Get("X-Original-Forwarded-For")
 	if xoff != "" {
 		ips := strings.Split(xoff, ",")
